@@ -1,14 +1,14 @@
 // pages/ReportScreen.jsx
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useLocation, useParams } from "wouter";
-import { useMutation, useQueryClient, useQueries } from "@tanstack/react-query";
+import { useMutation, useQueryClient, useQueries, useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { ButtonLoading } from "@/components/ui/button-loading";
 import { FileDown } from "lucide-react";
 import {
   generateReport,
   reviseReport,
-  clearReportMemory,
+  getReportMemoriesPB,   // PB 直读（不再按 anchor 过滤）
   useInsight,
   getInsight,
   useClientStore,
@@ -26,23 +26,17 @@ function ReportScreen() {
     ? Array.from(new Set(idsParam.split(",").map((s) => s.trim()).filter(Boolean)))
     : [];
 
-  // —— 当前选择签名：用于控制下载区块避免展示旧报告
+  // —— 当前选择签名：用于控制“本次运行后才显示下载（多选）”
   const currentSig = selectedIds.length ? selectedIds.slice().sort().join(",") : "";
-
-  // —— 仅当“本次点击生成”后才显示下载（多选时）
-  const [justGeneratedSig, setJustGeneratedSig] = useState("");
-  useEffect(() => {
-    setJustGeneratedSig(""); // 切换选择时重置
-  }, [currentSig]);
+  const [justRanSig, setJustRanSig] = useState("");
+  useEffect(() => setJustRanSig(""), [currentSig]);
 
   // —— 基础路由检查
   useEffect(() => {
-    if (!params || !params.insight_id) {
-      navigate("/insights", { replace: true });
-    }
+    if (!params || !params.insight_id) navigate("/insights", { replace: true });
   }, []);
 
-  // —— 锚点洞见（承载 docx）
+  // —— 锚点洞见（承载旧 docx 字段；生成或修改后仍刷新它）
   const query = useInsight(params.insight_id);
   const queryClient = useQueryClient();
 
@@ -58,6 +52,39 @@ function ReportScreen() {
   const selectedError = selectedQueries.find((q) => q.isError)?.error;
   const selectedDetails = selectedQueries.map((q) => q.data).filter(Boolean);
 
+  // —— 从 PB 取 report_memories（全量，按时间倒序）
+  const memoriesQuery = useQuery({
+    queryKey: ["report_memories_pb_all"],
+    queryFn: getReportMemoriesPB,
+  });
+  const memories = useMemo(() => {
+    const arr = Array.isArray(memoriesQuery.data) ? memoriesQuery.data : [];
+    // 统一字段：id/title/docx_path/updated/created
+    return arr.map((r) => ({
+      id: r.id,
+      title: r.title || "(未命名)",
+      docx_path: r.docx_path || "",
+      updated: r.updated || r.created || "",
+      created: r.created || "",
+    }));
+  }, [memoriesQuery.data]);
+
+  // —— 选择的记忆ID（“应用修改”的基底）
+  const [selectedMemoryId, setSelectedMemoryId] = useState("");
+  // —— 记录本次生成/修改后后端回传的新 memory_id（若后端返回）
+  const [lastMemoryId, setLastMemoryId] = useState("");
+
+  useEffect(() => {
+    // 列表变化后默认选最新；如果后端刚回了 memory_id，就优先选它
+    if (lastMemoryId) {
+      setSelectedMemoryId(lastMemoryId);
+      return;
+    }
+    if (!selectedMemoryId && memories.length) {
+      setSelectedMemoryId(memories[0].id);
+    }
+  }, [memories, lastMemoryId, selectedMemoryId]);
+
   // —— 修改意见（用于“应用修改”）
   const commentFromStore = useClientStore((s) => s.comment);
   const updateComment = useClientStore((s) => s.updateComment);
@@ -70,61 +97,55 @@ function ReportScreen() {
 
   // ===== /report/generate =====
   const generateMut = useMutation({
-    mutationFn: async (data) => generateReport(data),
-    onSuccess: () => {
+    mutationFn: (data) => generateReport(data),
+    onSuccess: (res) => {
+      // 刷新锚点 & 记忆列表（PB 直读）
       queryClient.invalidateQueries({ queryKey: ["insight", params.insight_id] });
-      setJustGeneratedSig(currentSig);
+      queryClient.invalidateQueries({ queryKey: ["report_memories_pb_all"] });
+      setJustRanSig(currentSig);
+      // 兼容：后端若返回 memory_id，则默认选它
+      setLastMemoryId(res?.data?.memory_id || "");
     },
   });
 
   // ===== /report/revise =====
   const reviseMut = useMutation({
-    mutationFn: async (data) => reviseReport(data),
-    onSuccess: () => {
+    mutationFn: (data) => reviseReport(data),
+    onSuccess: (res) => {
       queryClient.invalidateQueries({ queryKey: ["insight", params.insight_id] });
-      setJustGeneratedSig(currentSig);
+      queryClient.invalidateQueries({ queryKey: ["report_memories_pb_all"] });
+      setJustRanSig(currentSig);
+      setLastMemoryId(res?.data?.memory_id || "");
     },
   });
 
-  // ===== /report/clear_memory =====
-  const clearMemMut = useMutation({
-    mutationFn: async (data) => clearReportMemory(data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["insight", params.insight_id] });
-    },
-  });
-
-  const isBusy = generateMut.isPending || reviseMut.isPending || clearMemMut.isPending;
+  const isBusy = generateMut.isPending || reviseMut.isPending;
 
   // —— 首次生成（严格不读记忆）
   function submitGenerate() {
-    const payload = {
-      insight_id: params.insight_id, // 锚点不变
+    generateMut.mutate({
+      insight_id: params.insight_id,                        // 锚点用于上传 docx
       insight_ids: selectedIds.length ? selectedIds : undefined, // 合并生成
-      toc: [""], // 留空走后端默认标题；如果你加了标题输入框，就把标题放到 toc[0]
-    };
-    generateMut.mutate(payload);
-  }
-
-  // —— 应用修改（基于记忆）
-  function submitRevise() {
-    if (!localComment.trim()) return;
-    const payload = {
-      insight_id: params.insight_id,
-      comment: localComment.trim(),
-      // 传生成时的 ids 以便后端重拉附录/链接（可选）
-      insight_ids_for_footer: selectedIds.length ? selectedIds : undefined,
-    };
-    reviseMut.mutate(payload);
-  }
-
-  // —— 清除记忆
-  function submitClearMemory() {
-    clearMemMut.mutate({
-      insight_id: params.insight_id,
-      // 或 { clear_all: true } 清全部
+      toc: [""],                                            // 留空走后端默认标题
     });
   }
+
+  // —— 应用修改（基于所选记忆）
+  function submitRevise() {
+    if (!localComment.trim() || !selectedMemoryId) return;
+    reviseMut.mutate({
+      insight_id: params.insight_id,          // 用于上传 docx 的目标 insight
+      memory_id: selectedMemoryId,            // 关键：指定基底记忆
+      comment: localComment.trim(),
+      insight_ids_for_footer: selectedIds.length ? selectedIds : undefined,
+    });
+  }
+
+  // —— 下载链接：用“所选历史报告”的 docx_path
+  const currentDownload = useMemo(() => {
+    const m = memories.find((x) => x.id === selectedMemoryId);
+    return m?.docx_path ? { url: m.docx_path, filename: m.title } : null;
+  }, [memories, selectedMemoryId]);
 
   return (
     <div className="text-left">
@@ -160,8 +181,53 @@ function ReportScreen() {
         )}
       </div>
 
-      {/* 修改意见（仅用于“应用修改”） */}
+      {/* 历史报告（来自 PB.report_memories 全量） */}
       <div className="grid gap-2 max-w-screen-md">
+        <h3 className="my-2">历史报告（选择一条作为“应用修改”的基底）</h3>
+        {memoriesQuery.isLoading && <div className="text-slate-500">加载历史报告中…</div>}
+        {memoriesQuery.isError && (
+          <div className="text-red-500">
+            加载失败：{String(memoriesQuery.error?.message || memoriesQuery.error)}
+          </div>
+        )}
+        {!memoriesQuery.isLoading && memories.length === 0 && (
+          <div className="text-slate-500">暂无历史报告</div>
+        )}
+        {!memoriesQuery.isLoading && memories.length > 0 && (
+          <ul className="border rounded divide-y">
+            {memories.map((m) => (
+              <li key={m.id} className="flex items-center gap-3 p-3">
+                <input
+                  type="radio"
+                  name="memory"
+                  className="h-4 w-4"
+                  checked={selectedMemoryId === m.id}
+                  onChange={() => setSelectedMemoryId(m.id)}
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="font-medium truncate">{m.title}</div>
+                  <div className="text-xs text-slate-500 mt-0.5">
+                    更新时间：{m.updated || "-"}
+                  </div>
+                  {m.docx_path && (
+                    <a
+                      className="text-sm text-blue-600 hover:underline break-all"
+                      href={m.docx_path}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      下载 DOCX
+                    </a>
+                  )}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* 修改意见 */}
+      <div className="grid gap-2 max-w-screen-md mt-6">
         <h3 className="my-2">修改意见</h3>
         <Textarea
           placeholder="示例：1）标题突出××；2）综述补充国家发改委口径；3）行业动态-核能条目更简洁；4）时间统一为YYYY年M月D日。"
@@ -181,22 +247,19 @@ function ReportScreen() {
         ) : (
           <>
             <Button onClick={submitGenerate}>首次生成</Button>
-
             <Button
               variant="outline"
               onClick={submitRevise}
-              disabled={!localComment.trim()}
-              title={localComment.trim() ? "" : "请输入修改意见"}
+              disabled={!localComment.trim() || !selectedMemoryId}
+              title={
+                !localComment.trim()
+                  ? "请输入修改意见"
+                  : !selectedMemoryId
+                  ? "请选择一条历史报告"
+                  : ""
+              }
             >
-              应用修改（基于记忆）
-            </Button>
-
-            <Button
-              variant="destructive"
-              onClick={submitClearMemory}
-              title="清除此锚点的记忆；下次首次生成不会受旧版本影响"
-            >
-              清除记忆
+              应用修改（基于所选历史报告）
             </Button>
           </>
         )}
@@ -208,23 +271,17 @@ function ReportScreen() {
         )}
       </div>
 
-      {/* 下载区域（多选需“本次生成完成”才显示；单条保持历史可见） */}
+      {/* 下载区：多选时仅在“本次运行后”显示，以防展示旧结果；单条则始终可见 */}
       {(() => {
-        const canShowDownload =
-          !!query.data?.docx && (!idsParam ? true : justGeneratedSig === currentSig);
-        return !isBusy && canShowDownload;
+        const canShow = !!currentDownload && (!idsParam ? true : justRanSig === currentSig);
+        return !isBusy && canShow;
       })() && (
         <div className="grid gap-1.5 max-w-screen-md border rounded px-4 py-2 pb-6">
-          <p className="my-4">报告已生成，点击下载</p>
+          <p className="my-4">报告可下载</p>
           <p className="bg-slate-100 px-4 py-2 hover:underline flex gap-2 items-center overflow-hidden">
             <FileDown className="h-4 w-4 text-slate-400" />
-            <a
-              className="truncate"
-              href={`${import.meta.env.VITE_PB_BASE}/api/files/${query.data.collectionName}/${query.data.id}/${query.data.docx}`}
-              target="_blank"
-              rel="noreferrer"
-            >
-              {query.data.docx}
+            <a className="truncate" href={currentDownload.url} target="_blank" rel="noreferrer">
+              {currentDownload.filename}
             </a>
           </p>
         </div>
@@ -233,12 +290,13 @@ function ReportScreen() {
       {/* 错误显示 */}
       {query.isError && <p className="text-red-500 my-4">{query.error.message}</p>}
       {generateMut.isError && (
-        <p className="text-red-500 my-4">{generateMut.error.message}</p>
-      )}
-      {reviseMut.isError && <p className="text-red-500 my-4">{reviseMut.error.message}</p>}
-      {clearMemMut.isError && (
         <p className="text-red-500 my-4">
-          {String(clearMemMut.error?.message || clearMemMut.error)}
+          {String(generateMut.error?.message || generateMut.error)}
+        </p>
+      )}
+      {reviseMut.isError && (
+        <p className="text-red-500 my-4">
+          {String(reviseMut.error?.message || reviseMut.error)}
         </p>
       )}
     </div>

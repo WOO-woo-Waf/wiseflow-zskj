@@ -1,6 +1,6 @@
 from typing import List, Optional, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -51,18 +51,14 @@ class GenerateReportRequest(BaseModel):
     insight_ids: Optional[List[str]] = None
 
 
+# ------- 新的请求体（确保 memory_id 为必填）-------
 class ReviseReportRequest(BaseModel):
-    """基于上一版快照 + 修改意见，结构锁定改写"""
-    insight_id: str
-    comment: str                          # 修改意见（必填）
-    # 为了在修改时也保留“文末附录/行内链接”的文章集，可把生成使用过的 insight_ids 再传进来
-    insight_ids_for_footer: Optional[List[str]] = None
+    """基于选中的记忆 + 修改意见进行结构锁定改写"""
+    insight_id: str                      # 用于把新 DOCX 上传到哪个 insight 的 docx 字段
+    comment: str                         # 修改意见（必填）
+    memory_id: str                       # ★ 必填：作为底稿的 report_memories 记录 ID
+    insight_ids_for_footer: Optional[List[str]] = None  # 可选：用于重拉附录/行内链接
 
-
-class ClearMemoryRequest(BaseModel):
-    """清除记忆：可清单个，也可一键清空全部"""
-    insight_id: Optional[str] = None
-    clear_all: bool = False
 
 
 # =======================
@@ -72,7 +68,7 @@ class ClearMemoryRequest(BaseModel):
 app = FastAPI(
     title="wiseflow Backend Server",
     description="From WiseFlow Team.",
-    version="0.3",
+    version="0.4",
     openapi_url="/openapi.json"
 )
 
@@ -115,17 +111,25 @@ def add_article_from_insight(request: ReportRequest):
 
 
 # =======================
-# 新的三大接口
+# 新的报告相关接口
 # =======================
+
 
 @app.post("/report/generate")
 def generate_report(request: GenerateReportRequest):
     """
     首次生成（严格不读记忆）：
     - 仅使用这次传入的洞见/文章拼接材料
-    - 调用 LLM 生成固定模板正文
-    - 解析并渲染 DOCX（条目后 1~3 链接 + “附：原始信息网页”）
-    - 上传 PB（文件名优先取 toc[0]），返回可下载文件名
+    - 调用 LLM 生成正文
+    - 渲染 DOCX 并上传 PB（文件名优先取 toc[0]）
+    - 在 report_memories 写入一条新记录
+    返回：
+    {
+      code: 11,
+      data: {
+        insight_id, title, docx_filename, docx_url, memory_id
+      }
+    }
     """
     return bs.generate_report(
         anchor_id=request.insight_id,
@@ -137,33 +141,26 @@ def generate_report(request: GenerateReportRequest):
 @app.post("/report/revise")
 def revise_report(request: ReviseReportRequest):
     """
-    追加修改（基于上一版快照）：
-    - 读取记忆中的最新快照
-    - 基于 comment 做结构锁定改写
-    - 重新渲染 DOCX 并上传 PB
-    - 可选：传 insight_ids_for_footer 以重拉文章，保证附录/链接
+    应用修改（基于选中的记忆）：
+    - 必须传 memory_id：以该条 report_memories.snapshot 为底稿改写
+    - get_report() 内部完成：按意见改写→渲染新 DOCX→写入新的 report_memories
+    返回：
+    {
+      code: 11,
+      data: { title, memory_id, docx_path }
+    }
     """
     if not request.comment.strip():
         raise InvalidInputException("comment is required for /report/revise")
+    if not request.memory_id.strip():
+        raise InvalidInputException("memory_id is required for /report/revise")
+
     return bs.revise_report(
         anchor_id=request.insight_id,
         comment=request.comment,
-        insight_ids_for_footer=request.insight_ids_for_footer
+        insight_ids_for_footer=request.insight_ids_for_footer,
+        memory_id=request.memory_id,
     )
-
-
-@app.post("/report/clear_memory")
-def clear_memory_v2(request: ClearMemoryRequest):
-    """
-    清除记忆：
-    - { "clear_all": true } → 清全部任务记忆
-    - { "insight_id": "xxx" } → 清单个任务记忆
-    """
-    return bs.clear_report_memory(
-        insight_id=request.insight_id,
-        clear_all=request.clear_all
-    )
-
 
 # =======================
 # 旧接口兼容（可逐步下线）
@@ -176,10 +173,16 @@ def report_compat(request: ReportRequest):
     - force_regenerate 或 comment 为空 → 当作“首次生成”（严格不读记忆）
     - comment 非空 → 当作“修改”（基于最新快照）
     """
-    return bs.report(
-        insight_id=request.insight_id,
-        topics=request.toc,
-        comment=request.comment,
-        insight_ids=request.insight_ids,
-        force_regenerate=request.force_regenerate,
-    )
+    if request.force_regenerate or not request.comment.strip():
+        return bs.generate_report(
+            anchor_id=request.insight_id,
+            topics=request.toc,
+            insight_ids=request.insight_ids or [request.insight_id]
+        )
+    else:
+        return bs.revise_report(
+            anchor_id=request.insight_id,
+            comment=request.comment,
+            insight_ids_for_footer=request.insight_ids,
+            memory_id=None,  # 旧接口无 memory_id，后端走“最新”逻辑
+        )

@@ -15,7 +15,12 @@ async def process_site(site, counter):
         return
     if counter % site['per_hours'] == 0:
         logger.info(f"applying {site['url']}")
-        await pipeline(site['url'].rstrip('/'))
+        await pipeline(
+            site['url'].rstrip('/'),
+            category=(site.get('category') or ""),
+            within_days=int(site.get('within_days') or 30)
+        )
+
 
 
 async def schedule_pipeline(interval):

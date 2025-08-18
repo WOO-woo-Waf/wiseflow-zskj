@@ -1,39 +1,104 @@
 import os
+from pathlib import Path
 import time
 import json
 import uuid
-from get_report import get_report, logger, pb, revise_snapshot_text, build_docx_from_snapshot, PROJECT_DIR
+
+from dotenv import load_dotenv
+from get_report import cn_today_str, get_report, logger, pb, revise_snapshot_text, build_docx_from_snapshot, PROJECT_DIR
 from get_search import search_insight
 from datetime import datetime
 
+# ========== PB 持久化记忆 + 后端服务（替换你给的整段） ==========
+# ========== 环境 & 客户端 ==========
+ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(ROOT / ".env", override=True)
+# 可选：用于兜底构造 PocketBase 文件URL（如 pb_api 未提供现成方法）
+PB_BASE_URL = os.environ.get("PB_BASE_URL", "").rstrip("/")
 
 
-# ========== 记忆存储（每个 anchor 仅一份最新快照） ==========
-class MemoryStore:
-    """只保存每个 anchor(insight_id) 的一份最新快照与历史；支持清全部。"""
-    def __init__(self):
-        # { anchor_id: {"snapshot": str, "filename": str, "history": [ {"snapshot":..., "filename":...} ] } }
-        self._mem = {}
+# ---- PB 辅助：获取 insights.docx 的下载 URL ----
+def _resolve_docx_url_from_insights(anchor_id: str) -> str:
+    """
+    读取 insights 记录，尽力从 docx 字段解析出可下载链接。
+    兼容几种返回形态：字符串文件名 / 完整URL / dict/list。
+    """
+    try:
+        recs = pb.read("insights", fields=["id", "docx"], filter=f'id="{anchor_id}"')
+        if not recs or not recs[0]:
+            return ""
+        docx_field = recs[0].get("docx")
+        # 1) 已是完整 URL
+        if isinstance(docx_field, str) and docx_field.startswith("http"):
+            return docx_field
+        # 2) 仅是文件名，尝试用 pb_api 的便捷方法
+        if isinstance(docx_field, str) and docx_field:
+            # 若 pb_api 暴露了 file_url/get_file_url 之类方法，优先使用
+            for attr in ("file_url", "get_file_url", "get_download_url"):
+                if hasattr(pb, attr):
+                    try:
+                        return getattr(pb, attr)("insights", anchor_id, docx_field)
+                    except Exception:
+                        pass
+            # 兜底：按 PocketBase 规范拼 URL
+            if PB_BASE_URL:
+                return f"{PB_BASE_URL}/api/files/insights/{anchor_id}/{docx_field}"
+            return ""
+        # 3) dict/list 里找 url 字段
+        if isinstance(docx_field, dict):
+            return docx_field.get("url") or docx_field.get("downloadUrl") or ""
+        if isinstance(docx_field, list) and docx_field:
+            item = docx_field[0]
+            if isinstance(item, str) and item.startswith("http"):
+                return item
+            if isinstance(item, dict):
+                return item.get("url") or item.get("downloadUrl") or ""
+    except Exception as e:
+        logger.warning(f"_resolve_docx_url_from_insights error: {e}")
+    return ""
 
-    def get(self, anchor_id: str) -> dict | None:
-        return self._mem.get(anchor_id)
 
-    def set(self, anchor_id: str, snapshot: str, filename: str):
-        prev = self._mem.get(anchor_id)
-        if prev and prev.get("snapshot") and prev.get("filename"):
-            hist = prev.get("history", [])
-            hist.insert(0, {"snapshot": prev["snapshot"], "filename": prev["filename"]})
-            self._mem[anchor_id] = {"snapshot": snapshot, "filename": filename, "history": hist[:20]}
-        else:
-            self._mem[anchor_id] = {"snapshot": snapshot, "filename": filename, "history": []}
+# ---- PB：保存一条报告记忆 ----
+def _save_report_memory_to_pb(anchor_id: str, title: str, snapshot_text: str,
+                              docx_filename: str, docx_url: str) -> str:
+    body = {
+        "anchor_id": anchor_id,
+        "title": title,
+        "snapshot": snapshot_text,
+        "docx_filename": docx_filename,
+        "docx_url": docx_url,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "updated": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        rec_id = pb.add(collection_name="report_memories", body=body)
+        return str(rec_id or "")
+    except Exception as e:
+        logger.warning(f"save report memory failed: {e}")
+        return ""
 
-    def clear_one(self, anchor_id: str) -> int:
-        return 1 if self._mem.pop(anchor_id, None) is not None else 0
 
-    def clear_all(self) -> int:
-        n = len(self._mem)
-        self._mem.clear()
-        return n
+# ---- PB：读取某 anchor 最新一条记忆（按 updated/created 选最近） ----
+def _get_latest_report_memory_from_pb(anchor_id: str) -> dict | None:
+    try:
+        recs = pb.read(collection_name="report_memories",
+                       fields=["id", "anchor_id", "title", "snapshot",
+                               "docx_filename", "docx_url", "created", "updated"],
+                       filter=f'anchor_id="{anchor_id}"')
+        if not recs:
+            return None
+        # 选择更新最晚的一条
+        def _ts(r):
+            t = r.get("updated") or r.get("created") or ""
+            try:
+                return datetime.fromisoformat(t.replace("Z", "+00:00"))
+            except Exception:
+                return datetime.min
+        recs.sort(key=_ts, reverse=True)
+        return recs[0]
+    except Exception as e:
+        logger.warning(f"read latest report memory failed: {e}")
+        return None
 
 
 # ========== 后端服务 ==========
@@ -42,12 +107,131 @@ class BackendService:
         self.project_dir = PROJECT_DIR
         self.cache_url = os.path.join(self.project_dir, "backend_service")
         os.makedirs(self.cache_url, exist_ok=True)
-        self.memory = MemoryStore()
         logger.info("backend service init success.")
 
-    # ---- 通用返回包装（若你已有同名实现可保留原实现） ----
-    def build_out(self, code: int, data):
+    @staticmethod
+    def build_out(code: int, data):
         return {"code": code, "data": data}
+
+    # ---------- 工具：读取单条记忆，拿到 docx_path ----------
+    def _read_memory_docx_path(self, memory_id: str) -> str:
+        try:
+            recs = pb.read(
+                "report_memories",
+                fields=["id", "docx_path"],
+                filter=f'id="{memory_id}"'
+            )
+            if recs and recs[0]:
+                return recs[0].get("docx_path") or ""
+        except Exception as e:
+            logger.warning(f"_read_memory_docx_path error: {e}")
+        return ""
+
+    # ---------- 首次生成（不读记忆；仅返回下载链接等） ----------
+    def generate_report(self, anchor_id: str, topics: list[str], insight_ids: list[str] | None) -> dict:
+        """
+        - 仅使用本次传入的洞见/文章生成
+        - 由 get_report() 内部完成：逐洞见处理/汇总、渲染 DOCX、保存记忆（title/snapshot/docx_path）
+        - 本方法只负责把下载链接等返回给前端
+        """
+        try:
+            target_ids = list(dict.fromkeys([_id for _id in (insight_ids or [anchor_id]) if _id]))
+            if not target_ids:
+                return self.build_out(-2, "no valid insight id")
+
+            # 拉 entries + footer
+            entries, footer = self._fetch_entries_and_footer(target_ids)
+            if not entries:
+                return self.build_out(-2, "no valid insight found")
+
+            # 本地临时 docx 路径（传入 get_report 用来渲染）
+            tmp_docx = os.path.join(self.cache_url, f"{anchor_id}_{uuid.uuid4()}.docx")
+
+            # 调用你新版 get_report（它会入库记忆，并返回 memory_id）
+            # 新版约定返回 4 元组：ok, snapshot_text, report_title, memory_id
+            ok, snapshot_text, report_title, memory_id = get_report(
+                insight_entries=entries,
+                articles=footer or [],
+                memory="",              # 首次生成不读记忆
+                topics=topics,
+                comment="",             # 无改写意见
+                docx_file=tmp_docx,
+            )
+            if not ok:
+                return self.build_out(-11, "report generate failed")
+
+            # 根据 memory_id 拿 docx_path（下载链接）
+            docx_path = self._read_memory_docx_path(memory_id) if memory_id else ""
+            if not docx_path:
+                logger.warning("report generated but docx_path is empty in memory")
+
+            return self.build_out(11, {
+                "title": report_title,
+                "memory_id": memory_id,
+                "docx_path": docx_path,     # 前端直接用这个链接下载
+            })
+        except Exception as e:
+            logger.error(f"generate_report error: {e}")
+            return self.build_out(-2, "internal error")
+
+    # ---------- 追加修改（基于前端选中的 memory + comment） ----------
+    def revise_report(self,
+                      anchor_id: str,
+                      comment: str,
+                      insight_ids_for_footer: list[str] | None = None,
+                      memory_id: str | None = None) -> dict:
+        """
+        - 前端必须传 memory_id：服务层从 PB 读出 memory.snapshot，然后把 memory + comment 交给 get_report 改写
+        - get_report() 内部完成渲染 DOCX & 保存“新记忆”
+        - 本方法返回新记忆的下载链接（docx_path）
+        """
+        try:
+            if not (comment or "").strip():
+                return self.build_out(-2, "comment required")
+            if not (memory_id or "").strip():
+                return self.build_out(-2, "memory_id required")
+
+            # 读出被选中的历史快照
+            mem = pb.read(
+                "report_memories",
+                fields=["id", "snapshot", "title"],
+                filter=f'id="{memory_id}"'
+            )
+            if not mem or not mem[0] or not (mem[0].get("snapshot") or "").strip():
+                return self.build_out(-2, "invalid memory_id or empty snapshot")
+            base_snapshot = mem[0]["snapshot"]
+
+            # 可选：重拉 footer（保证文末附录/行内链接）
+            footer = []
+            if insight_ids_for_footer:
+                _, footer = self._fetch_entries_and_footer(list(dict.fromkeys(insight_ids_for_footer)))
+
+            tmp_docx = os.path.join(self.cache_url, f"{anchor_id}_{uuid.uuid4()}.docx")
+
+            # 调用 get_report 的“改写模式”
+            ok, new_text, report_title, new_memory_id = get_report(
+                insight_entries=[],         # 改写不需要 entries
+                articles=footer or [],
+                memory=base_snapshot,       # 关键：传入原快照
+                topics=[report_title] if (report_title := mem[0].get("title")) else [""],
+                comment=comment,            # 改写意见
+                docx_file=tmp_docx,
+            )
+            if not ok:
+                return self.build_out(-11, "revise failed")
+
+            docx_path = self._read_memory_docx_path(new_memory_id) if new_memory_id else ""
+            if not docx_path:
+                logger.warning("revise succeeded but docx_path is empty in memory")
+
+            return self.build_out(11, {
+                "title": report_title or (new_text.splitlines()[0].strip() if new_text else f"中核日报（{cn_today_str()}）"),
+                "memory_id": new_memory_id,
+                "docx_path": docx_path,
+            })
+        except Exception as e:
+            logger.error(f"revise_report error: {e}")
+            return self.build_out(-2, "internal error")
 
     # ---- 拉取洞见与文章并组装为 entries/footer ----
     def _fetch_entries_and_footer(self, insight_ids: list[str]):
@@ -55,7 +239,8 @@ class BackendService:
         for iid in insight_ids:
             rec = pb.read(
                 "insights",
-                fields=["id", "content", "tag", "keywords", "articles", "docx"],
+                # 注意多取一个 url 字段，作为洞见的“源链接”
+                fields=["id", "content", "tag", "keywords", "articles", "url", "docx"],
                 filter=f'id="{iid}"',
             )
             if rec and rec[0]:
@@ -82,7 +267,7 @@ class BackendService:
             if rec and rec[0]:
                 articles_map[aid] = rec[0]
 
-        # 组装 entries & footer
+        # 组装 entries（供 get_report 使用） & footer（文末附录）
         used_article_ids = []
         entries = []
         for ins in insights:
@@ -99,7 +284,7 @@ class BackendService:
                     "title": a.get("title", ""),
                     "url": a.get("url", ""),
                     "publish_time": a.get("publish_time", ""),
-                    # 如果你希望 LLM 材料中包含文章摘要，可在此把 abstract/content 注入到 entries
+                    # 如需把摘要送入 LLM，可取消注释
                     # "abstract": (a.get("abstract") or a.get("content") or "")[:MAX_ABSTRACT_CHARS],
                 })
                 used_article_ids.append(aid)
@@ -109,7 +294,10 @@ class BackendService:
                 "content": (ins.get("content") or "").strip(),
                 "tag": ins.get("tag") or "",
                 "keywords": kws,
+                "url": ins.get("url", "") or "",   # 关键：洞见的源链接
                 "articles": links,
+                # 也可把 category 放进来（若存在）
+                "category": ins.get("category") or "",
             })
 
         footer_articles = []
@@ -130,104 +318,6 @@ class BackendService:
             })
 
         return entries, footer_articles
-
-    # ---- 首次生成（严格不读记忆） ----
-    def generate_report(self, anchor_id: str, topics: list[str], insight_ids: list[str]) -> dict:
-        try:
-            target_ids = list(dict.fromkeys([_id for _id in (insight_ids or [anchor_id]) if _id]))
-            if not target_ids:
-                return self.build_out(-2, "no valid insight id")
-
-            entries, footer = self._fetch_entries_and_footer(target_ids)
-            if not entries:
-                return self.build_out(-2, "no valid insight found")
-
-            tmp_docx = os.path.join(self.cache_url, f"{anchor_id}_{uuid.uuid4()}.docx")
-            ok, snapshot, report_title = get_report(
-                insight_entries=entries,
-                articles=footer or [],
-                memory="",          # 首次生成忽略记忆
-                topics=topics,
-                comment="",         # 首次生成忽略 comment
-                docx_file=tmp_docx,
-            )
-            if not ok:
-                return self.build_out(-11, "report generate failed.")
-
-            final_filename = f"{report_title}.docx"
-            with open(tmp_docx, "rb") as f:
-                message = pb.upload("insights", anchor_id, "docx", final_filename, f)
-            if not message:
-                return self.build_out(-2, "report generated but PB update failed")
-
-            # 写入记忆（仅一份最新）
-            self.memory.set(anchor_id, snapshot, final_filename)
-            logger.debug(f"report success and updated PB: {anchor_id}")
-            # 返回可下载文件名（前端从 PB 的 docx 字段即可下载）
-            return self.build_out(11, {"insight_id": anchor_id, "filename": final_filename})
-        except Exception as e:
-            logger.error(f"generate_report error: {e}")
-            return self.build_out(-2, "internal error")
-
-    # ---- 追加修改（基于上一版快照） ----
-    def revise_report(self, anchor_id: str, comment: str, insight_ids_for_footer: list[str] | None = None) -> dict:
-        """
-        如需保证附录仍完整，可传 insight_ids_for_footer 以便重拉文章生成 footer；
-        不传则附录生成空列表（仅改正文）。
-        """
-        try:
-            prev = self.memory.get(anchor_id)
-            if not prev or not prev.get("snapshot"):
-                return self.build_out(-2, "no previous snapshot to revise")
-
-            revised = revise_snapshot_text(prev["snapshot"], comment, logger_=logger)
-            if not revised:
-                return self.build_out(-11, "revise failed")
-
-            # 重新拉一遍文章，保证行内链接/附录仍可生成（推荐做法）
-            footer = []
-            if insight_ids_for_footer:
-                _, footer = self._fetch_entries_and_footer(list(dict.fromkeys(insight_ids_for_footer)))
-
-            tmp_docx = os.path.join(self.cache_url, f"{anchor_id}_{uuid.uuid4()}.docx")
-            ok = build_docx_from_snapshot(
-                snapshot_text=revised,
-                articles=footer or [],
-                docx_file=tmp_docx,
-                always_appendix=True,
-                inline_links=False,           # 修改时通常只改文字；如需也保留行内链接，可设 True 并传 grouped_for_links
-                grouped_for_links=None
-            )
-            if not ok:
-                return self.build_out(-11, "revise render failed")
-
-            report_title = revised.splitlines()[0].strip() if revised else f"中核日报（{cn_today_str()}）"
-            final_filename = f"{report_title}.docx"
-            with open(tmp_docx, "rb") as f:
-                message = pb.upload("insights", anchor_id, "docx", final_filename, f)
-            if not message:
-                return self.build_out(-2, "revise generated but PB update failed")
-
-            self.memory.set(anchor_id, revised, final_filename)
-            logger.debug(f"revise success and updated PB: {anchor_id}")
-            return self.build_out(11, {"insight_id": anchor_id, "filename": final_filename})
-        except Exception as e:
-            logger.error(f"revise_report error: {e}")
-            return self.build_out(-2, "internal error")
-
-    # ---- 清除记忆（可清单个或全部） ----
-    def clear_report_memory(self, insight_id: str | None = None, clear_all: bool = False) -> dict:
-        try:
-            if clear_all:
-                n = self.memory.clear_all()
-                return self.build_out(11, f"cleared {n} memory keys")
-            if not insight_id:
-                return self.build_out(-2, "insight_id required or set clear_all=True")
-            removed = self.memory.clear_one(insight_id)
-            return self.build_out(11, f"cleared {removed} memory key")
-        except Exception as e:
-            logger.error(f"clear_report_memory error: {e}")
-            return self.build_out(-2, "internal error")
 
     # ---- 旧接口兼容：/report ----
     def report(

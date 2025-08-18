@@ -5,7 +5,9 @@
 # when you receive flag 1, the result would be a tuple, means that the input url is possible a article_list page
 # and the set contains the url of the articles.
 # when you receive flag 11, you will get the dict contains the title, content, url, date, and the source of the article.
-
+import re
+import sys
+from typing import Union, Tuple, Set, Dict
 from gne import GeneralNewsExtractor
 import httpx
 from bs4 import BeautifulSoup
@@ -22,6 +24,10 @@ from typing import Union
 from requests.compat import urljoin
 from scrapers import scraper_map
 
+ONCLICK_URL_RE = re.compile(
+    r"""(?:window\.open|location\.href\s*=|open)\s*\(\s*['"](?P<u>[^'"]+)['"]""",
+    re.I
+)
 
 model = os.environ.get('HTML_PARSE_MODEL', 'gpt-4o-mini-2024-07-18')
 header = {
@@ -219,14 +225,62 @@ def _decode_response_text(response, logger) -> str:
     return response.text or ""
 
 
+# === 新增/调整：新闻识别配置 ===
+NEWS_PATH_KEYWORDS = (
+    "/news", "/press", "/media", "/information", "/xinwen", "/zhxw", "/xwzx",
+    "/updates", "/notice", "/announc", "/bulletin", "/article", "/reports",
+    "/detail",   # ★ 新增：很多站的详情路径
+)
+
+V_SEGMENT_RE = re.compile(r"/v/\d+(/|$)")
+
+NON_NEWS_DENY_PREFIXES = (
+    "/language", "/lang",
+)
+# URL 中的日期模式：/2025/08/18/ 或 /202508/ 或 t20250818_12345.html 等
+DATE_IN_URL = re.compile(
+    r"(?:(?:/20\d{2}[/._-]?(?:0?[1-9]|1[0-2])[/._-]?(?:0?[1-9]|[12]\d|3[01]))|t20\d{6,8}_\d+|/20\d{2}/(?:0?[1-9]|1[0-2])(?:/|$))",
+    re.I,
+)
+
+def _path_depth(path: str) -> int:
+    return len([seg for seg in path.split("/") if seg])
+
+def _is_news_like_url(path: str, query: str, anchor_text: str = "") -> bool:
+    """
+    仅用“路径级”启发式判断是否像新闻链接：
+      - 排除明显的非新闻前缀
+      - 命中新闻关键词 or 带日期  → 强信号
+      - 适度限制：优先 .html，且路径深度 >= 2
+    """
+    low_path = path.lower()
+
+    # 明确排除
+    for deny in NON_NEWS_DENY_PREFIXES:
+        if low_path.startswith(deny):
+            return False
+
+    kw_hit   = any(kw in low_path for kw in NEWS_PATH_KEYWORDS)
+    date_hit = bool(DATE_IN_URL.search(low_path))
+    v_hit    = bool(V_SEGMENT_RE.search(low_path))  # ★ 新增：/v/123456/ 结构
+
+    anchor_hit = False
+    if anchor_text:
+        t = anchor_text.strip().lower()
+        if any(k in t for k in ("news", "press", "media", "公告", "新闻", "资讯", "动态", "报道", "通告", "通知")):
+            anchor_hit = True
+
+    depth_ok  = _path_depth(low_path) >= 2
+    suffix_ok = low_path.endswith(".html") or date_hit or v_hit  # ★ 非 .html 但带日期或 /v/ 也放行
+
+    return suffix_ok and depth_ok and (kw_hit or date_hit or v_hit or anchor_hit)
+
 def _collect_same_site_links(final_url: str, soup: BeautifulSoup, logger) -> Set[str]:
     """
-    从页面里收集“同域链接”，保留查询串 ?query、丢弃 #fragment、过滤无效 href 和明显导航类路径。
-    返回 set(unique_urls)
+    从页面收集“同域 + 像新闻”的链接集合（更严格）。
     """
     final_parts = urlsplit(final_url)
     domain = final_parts.netloc
-    current_dir = final_parts.path.rsplit("/", 1)[0] + "/"  # 当前目录
     urls: Set[str] = set()
 
     for a in soup.find_all("a", href=True):
@@ -234,33 +288,95 @@ def _collect_same_site_links(final_url: str, soup: BeautifulSoup, logger) -> Set
         if not href or href.startswith(("javascript:", "mailto:", "tel:", "#")):
             continue
 
-        # 用最终 URL 作为基准来拼相对链接
         abs_url = urljoin(final_url, href)
-
         parts = urlsplit(abs_url)
-        # 仅收集同域链接（如需允许子域，改 _same_site 为 endswith）
+
+        # 仅同域
         if not _same_site(parts.netloc, domain):
             continue
-        # 收紧计数：仅限“同目录 + .html”
-        if not parts.path.startswith(current_dir):
-            continue
-        if not parts.path.endswith(".html"):
+
+        path = parts.path or "/"
+        if not _is_news_like_url(path, parts.query, getattr(a, "get_text", lambda: "")()):
             continue
 
-        # 过滤明显的“导航/搜索/站点地图”入口，减少 404/噪声
-        pth = parts.path.lower()
-        if pth.startswith(NAV_PATH_PREFIXES):
-            logger.debug(f"skip nav-like url: {abs_url}")
-            continue
-
-        # 丢弃 fragment，保留 query；urlunsplit 会自动补上 '?'
         parts = parts._replace(fragment="")
         abs_url = urlunsplit(parts)
-
         if abs_url != final_url:
             urls.add(abs_url)
 
     return urls
+
+ONCLICK_URL_RE = re.compile(r"(?:window\.open|location\.href\s*=|open)\s*\(\s*['\"](?P<u>[^'\"]+)['\"]", re.I)
+
+def _extract_js_nav_urls(final_url: str, soup: BeautifulSoup, domain: str, list_slug: str | None) -> set[str]:
+    urls = set()
+    # 覆盖 onclick/data-href/data-url/role=link
+    candidates = soup.select('[onclick], [data-href], [data-url], [role="link"]')
+
+    for el in candidates:
+        # ★ 排除位于导航/菜单/侧栏/页脚中的元素
+        if _is_in_excluded_zone(el):
+            continue
+
+        cand = None
+        if el.has_attr('onclick'):
+            m = ONCLICK_URL_RE.search(el.get('onclick') or '')
+            if m:
+                cand = m.group('u')
+        if not cand:
+            for attr in ('data-href', 'data-url'):
+                if el.has_attr(attr) and el.get(attr):
+                    cand = el.get(attr)
+                    break
+        if not cand:
+            continue
+
+        abs_url = urljoin(final_url, cand.strip())
+        parts = urlsplit(abs_url)
+
+        # 仅同域
+        netloc = parts.netloc.lower().lstrip(".")
+        dom = urlsplit(final_url).netloc.lower().lstrip(".")
+        if netloc.startswith("www."): netloc = netloc[4:]
+        if dom.startswith("www."): dom = dom[4:]
+        if netloc != dom:
+            continue
+
+        path = (parts.path or "/").lower()
+
+        # ★ 栏目限定
+        if list_slug and (f"/detail_{list_slug}/" not in path):
+            continue
+
+        anchor_text = el.get_text(" ", strip=True) if hasattr(el, "get_text") else ""
+        if not _is_news_like_url(path, parts.query, anchor_text):
+            continue
+
+        parts = parts._replace(fragment="")
+        urls.add(urlunsplit(parts))
+
+    return urls
+
+
+# 顶部常量区新增
+EXCLUDE_ANCESTOR_SELECTORS = (
+    "header", "nav", "footer",
+    ".submenu", ".sub-menu", ".dropdown", ".dropdown-menu", ".menu", ".menus", ".navbar",
+    ".top-nav", ".topbar", ".toolbar", ".bread", ".breadcrumb", ".breadcrumbs",
+    ".sidebar", ".aside", ".left-nav", ".right-nav", ".sidenav", ".side-menu",
+    ".pager", ".pagination", ".pagebar", ".pages", ".tab", ".tabs", ".tabbar",
+    ".logo", ".site-nav", ".global-nav"
+)
+
+def _is_in_excluded_zone(el) -> bool:
+    """候选节点是否位于导航/顶部菜单/侧栏/页脚等容器内。"""
+    try:
+        for sel in EXCLUDE_ANCESTOR_SELECTORS:
+            if el.find_parent(sel):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 # === 新增：更强的“文章链接”识别 & 栏目页提示 ===
@@ -278,28 +394,186 @@ LIST_CLASS_HINTS = (
     ".list", ".news-list", ".list-unstyled", ".list-group"
 )
 
-def _extract_article_links(final_url: str, soup, domain: str) -> set[str]:
-    """从页面里抽‘像文章详情’的链接：同域 + 匹配文章路径模式 or .html 结尾"""
+LIST_SLUG_RE = re.compile(r"/list_(?P<slug>[a-z0-9_]+)/", re.I)
+
+def _extract_list_slug(url_or_path: str) -> str | None:
+    m = LIST_SLUG_RE.search(url_or_path)
+    return m.group("slug").lower() if m else None
+
+
+def _extract_article_links(final_url: str, soup: BeautifulSoup, domain: str, list_slug: str | None) -> set[str]:
     urls = set()
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
+        # ★ 排除位于导航/菜单/侧栏/页脚中的 a
+        if _is_in_excluded_zone(a):
+            continue
+
+        href = (a["href"] or "").strip()
         if not href or href.startswith(("javascript:", "#", "mailto:", "tel:")):
             continue
+
         abs_url = urljoin(final_url, href)
         parts = urlsplit(abs_url)
-        # 同域
+
+        # 仅同域
         netloc = parts.netloc.lower().lstrip(".")
-        if netloc.startswith("www."): netloc = netloc[4:]
         dom = domain.lower().lstrip(".")
+        if netloc.startswith("www."): netloc = netloc[4:]
         if dom.startswith("www."): dom = dom[4:]
         if netloc != dom:
             continue
-        path = parts.path
-        # 像文章详情的路径
-        if any(p.search(path) for p in ARTICLE_LINK_PATTERNS) or path.endswith(".html"):
-            parts = parts._replace(fragment="")
-            urls.add(urlunsplit(parts))
+
+        path = (parts.path or "/").lower()
+
+        # ★ 栏目限定：list_gzwx 只要 detail_gzwx
+        if list_slug and (f"/detail_{list_slug}/" not in path):
+            continue
+
+        # 新闻启发式（含日期/关键词/或 /v/123/）
+        anchor_text = a.get_text(" ", strip=True)
+        if not _is_news_like_url(path, parts.query, anchor_text):
+            continue
+
+        parts = parts._replace(fragment="")
+        urls.add(urlunsplit(parts))
     return urls
+
+# ===== 中文标题增强 =====
+CN_RE = re.compile(r"[\u4e00-\u9fff]")
+TITLE_SEPARATORS = r"\|\-—_｜·•"
+TITLE_SPLIT_RE = re.compile(rf"\s*[{TITLE_SEPARATORS}]\s*")
+
+TITLE_SELECTORS = (
+    "h1", "h2",
+    ".news-title", ".article-title", ".detail-title",
+    "[class*='title']",
+    "[id*='title']",
+    "[class*='biaoti']",
+    "[id*='biaoti']",
+)
+
+def _cn_ratio(s: str) -> float:
+    if not s: return 0.0
+    cnt = len(CN_RE.findall(s))
+    return cnt / max(1, len(s))
+
+def _normalize_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+def _guess_site_names(soup: BeautifulSoup, domain: str) -> set[str]:
+    names = set()
+    # og:site_name
+    m = soup.find("meta", {"property": "og:site_name"})
+    if m and m.get("content"): names.add(_normalize_space(m["content"]))
+    # <title> 拆分，短片段多为站名
+    if soup.title and soup.title.string:
+        for part in TITLE_SPLIT_RE.split(soup.title.string):
+            part = _normalize_space(part)
+            if 0 < len(part) <= 20:
+                names.add(part)
+    # 域名主干
+    dom = domain.lower()
+    dom = dom[4:] if dom.startswith("www.") else dom
+    names.add(dom.split(":")[0])
+    # 常见公司关键词作为弱匹配
+    for kw in ("有限公司", "集团", "公司", "股份", "门户网站"):
+        for n in list(names):
+            if kw in n:
+                names.add(n)
+    return {n for n in names if n}
+
+def _clean_title_segment(seg: str, site_names: set[str]) -> str:
+    s = _normalize_space(seg)
+    if not s: return s
+    # 去掉首尾站名 + 分隔符
+    for n in site_names:
+        if not n: continue
+        s = re.sub(rf"^({re.escape(n)})\s*[{TITLE_SEPARATORS}]*\s*", "", s)
+        s = re.sub(rf"\s*[{TITLE_SEPARATORS}]*\s*({re.escape(n)})\s*$", "", s)
+    return _normalize_space(s)
+
+def _clean_title(raw: str, site_names: set[str]) -> str:
+    raw = _normalize_space(raw)
+    if not raw: return raw
+    parts = [p for p in TITLE_SPLIT_RE.split(raw) if _normalize_space(p)]
+    if not parts: parts = [raw]
+    # 选“更像正文标题”的片段：中文占比、长度接近 10~40、有无新闻关键词等
+    def score(p: str) -> float:
+        p2 = _clean_title_segment(p, site_names)
+        L = len(p2)
+        len_score = 1.0 if 10 <= L <= 40 else (0.6 if 6 <= L <= 60 else 0.2)
+        kw_bonus = 0.2 if any(k in p2 for k in ("发布", "会议", "通知", "公告", "报道", "网讯", "召开", "举行")) else 0.0
+        return _cn_ratio(p2) * 2.0 + len_score + kw_bonus
+    best = max(parts, key=score)
+    return _clean_title_segment(best, site_names)
+
+def _collect_title_candidates(soup: BeautifulSoup) -> list[tuple[str, float]]:
+    """
+    返回 [(文本, 基础权重)]，只收中文候选，排除导航/侧栏/页脚等
+    """
+    cands: list[tuple[str, float]] = []
+
+    # 结构性标题
+    for sel in TITLE_SELECTORS:
+        for el in soup.select(sel):
+            try:
+                if _is_in_excluded_zone(el):
+                    continue
+            except Exception:
+                pass
+            txt = _normalize_space(el.get_text(" ", strip=True))
+            if not txt or _cn_ratio(txt) <= 0.2:
+                continue
+            # 基础权重：h1 > h2 > 其他
+            w = 2.5 if el.name == "h1" else (2.0 if el.name == "h2" else 1.5)
+            # class/id 中含 title/biaoti/news 提升
+            attr = " ".join([el.get("class") and " ".join(el.get("class")) or "", el.get("id") or ""]).lower()
+            if any(k in attr for k in ("title", "biaoti", "news", "detail")):
+                w += 0.5
+            cands.append((txt, w))
+
+    # meta 标题（次优）
+    for sel in (
+        'meta[property="og:title"]',
+        'meta[name="title"]',
+        'meta[name="twitter:title"]',
+    ):
+        m = soup.select_one(sel)
+        if m and m.get("content"):
+            txt = _normalize_space(m["content"])
+            if txt and _cn_ratio(txt) > 0.2:
+                cands.append((txt, 1.2))
+
+    return cands
+
+def refine_chinese_title(orig_title: str, soup: BeautifulSoup, domain: str) -> str:
+    """
+    根据 DOM 强化“中文正文标题”，若无法判定则返回清洗后的 orig_title。
+    """
+    site_names = _guess_site_names(soup, domain)
+
+    # 先清洗一下原始标题作为备选
+    fallback = _clean_title(orig_title or "", site_names)
+
+    cands = _collect_title_candidates(soup)
+    if not cands:
+        return fallback
+
+    # 评分：中文占比、长度、基础权重
+    def score(txt: str, base_w: float) -> float:
+        txt2 = _clean_title(txt, site_names)
+        L = len(txt2)
+        len_score = 1.0 if 10 <= L <= 40 else (0.6 if 6 <= L <= 60 else 0.2)
+        return base_w + _cn_ratio(txt2) * 2.0 + len_score
+
+    best_txt, best_w = max(cands, key=lambda x: score(x[0], x[1]))
+    best_txt = _clean_title(best_txt, site_names)
+
+    # 最终兜底：必须包含中文
+    if _cn_ratio(best_txt) <= 0.2:
+        return fallback
+    return best_txt
+
 
 def _is_list_like_page(soup) -> bool:
     """通过页面特征判断是否像‘列表页’：有分页/列表类名，或出现多次日期模式"""
@@ -352,15 +626,32 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
 
     soup = BeautifulSoup(text, "html.parser")
 
+    # ★ 识别当前列表页的栏目 slug（如 list_gzwx → gzwx）
+    list_slug = _extract_list_slug(final_parts.path)
+
+
     # ——先识别“文章详情链接集合”——
-    article_links = _extract_article_links(final_url, soup, domain)
-    if len(article_links) >= 3 or _is_list_like_page(soup):
-        # 只要像列表页，就不要跑 GNE/LLM，直接把子链接交回 pipeline
-        logger.info(f"{final_url} detected as list page, found {len(article_links)} article-like links")
-        # 给点调试：展示前几个
-        for i, u in enumerate(list(article_links)[:5]):
-            logger.debug(f"list candidate[{i}]: {u}")
-        return 1, article_links
+    article_links = _extract_article_links(final_url, soup, domain, list_slug)
+
+    # ★ 并入通过 onclick/data-* 抓到的链接
+    js_links = _extract_js_nav_urls(final_url, soup, domain, list_slug)
+    if js_links:
+        article_links |= js_links
+    # 仅当“新闻候选”达到阈值才视为列表页（比如 8，按需调小/调大）
+    NEWS_LIST_MIN = 4
+    if len(article_links) >= NEWS_LIST_MIN or _is_list_like_page(soup):
+        if len(article_links) >= NEWS_LIST_MIN:
+            logger.info(f"{final_url} detected as news list page, found {len(article_links)} news-like links")
+            for i, u in enumerate(list(article_links)[:5]):
+                logger.debug(f"list candidate[{i}]: {u}")
+            return 1, article_links
+        # 如果仅靠页面结构判定是列表页，再用“新闻过滤”收一次
+        fallback_urls = _collect_same_site_links(final_url, soup, logger)
+        if len(fallback_urls) >= NEWS_LIST_MIN:
+            logger.info(f"{final_url} looks like a list (structure), collected {len(fallback_urls)} news-like links")
+            for i, u in enumerate(list(fallback_urls)[:5]):
+                logger.debug(f"list candidate[{i}]: {u}")
+            return 1, fallback_urls
 
 
     # 先看 URL 是否像详情页（只要像，就先尝试正文抽取）
@@ -387,6 +678,8 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
                 except Exception:
                     result["abstract"] = ""
                 result["url"] = final_url
+                # GNE 提取成功后，返回前增加：
+                result["title"] = refine_chinese_title(result.get("title", ""), soup, domain)
                 return 11, result
             else:
                 logger.debug("detail-like url but GNE judged not good; will fall back to list/LLM flow.")
@@ -404,6 +697,7 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
         result = extractor.extract(text)
         if "meta" in result:
             del result["meta"]
+        result["title"] = refine_chinese_title(result.get("title", ""), soup, domain)
 
         # 常见异常页/隐私页/报错页过滤
         bad_title = (
@@ -447,7 +741,7 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
         if "title" not in result or "content" not in result:
             logger.debug("llm parsed result not good")
             return 0, {}
-
+        
         # 补充图片（绝对 URL）
         image_links = []
         for img in soup.find_all("img"):

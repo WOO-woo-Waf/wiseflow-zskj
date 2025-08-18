@@ -7,8 +7,8 @@ from utils.pb_api import PbTalker
 import os
 
 
-get_info_model = os.environ.get("GET_INFO_MODEL", "gpt-4o-mini-2024-07-18")
-rewrite_model = os.environ.get("REWRITE_MODEL", "gpt-4o-mini-2024-07-18")
+get_info_model = os.environ.get("GET_INFO_MODEL", "DeepSeek-R1")
+rewrite_model = os.environ.get("REWRITE_MODEL", "DeepSeek-R1")
 
 project_dir = os.environ.get("PROJECT_DIR", "")
 if project_dir:

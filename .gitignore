@@ -5,6 +5,17 @@
 .idea/
 __pycache__
 .env
+.vscode/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.pkl.gz
+*.pkl.bz2
+*.pkl.xz
+*.pkl.zstd
+*.pkl.lz4
+*.pkl.lzo       
 .venv/
 core/pb/pb_data/
 core/pb/CHANGELOG.md

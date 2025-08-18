@@ -114,11 +114,11 @@ export function generateReport({ insight_id, toc, insight_ids }) {
       toc,         // 例如 ["自定义标题"]；留 [""] 走后端默认
       insight_ids, // 可选：多选/合并生成
     },
-  });
+  }).then((res) => res.data);
 }
 
 // 基于记忆追加修改：POST /report/revise
-export function reviseReport({ insight_id, comment, insight_ids_for_footer }) {
+export function reviseReport({ insight_id, comment, memory_id, insight_ids_for_footer }) {
   return axios({
     method: "post",
     url: `${import.meta.env.VITE_API_BASE}/report/revise`,
@@ -126,9 +126,10 @@ export function reviseReport({ insight_id, comment, insight_ids_for_footer }) {
     data: {
       insight_id,
       comment,                 // 必填
-      insight_ids_for_footer,  // 可选：传生成用过的 ids 让后端重拉附录/链接
+      memory_id,               // ★ 必填：选中的 report_memories.id
+      insight_ids_for_footer,  // 可选：让后端重拉附录/链接
     },
-  });
+  }).then((res) => res.data);
 }
 
 // 清除记忆：POST /report/clear_memory
@@ -144,6 +145,12 @@ export function clearReportMemory({ insight_id, clear_all = false }) {
   });
 }
 
+// 直接从 PB 读取某锚点的历史报告（按更新时间倒序）
+export function getReportMemoriesPB() {
+  return pb.collection("report_memories").getFullList({
+    sort: "-updated",
+  });
+}
 
 export function more({ insight_id }) {
   return axios({
