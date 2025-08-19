@@ -6,9 +6,15 @@ import { Button } from "@/components/ui/button";
 import { ButtonLoading } from "@/components/ui/button-loading";
 import { FileDown } from "lucide-react";
 import {
+  // 后端交互
   generateReport,
   reviseReport,
-  getReportMemoriesPB,   // PB 直读（不再按 anchor 过滤）
+  // PB 直读（不再按 anchor 过滤，直接全量/或你在 store 内部自行加过滤）
+  getReportMemoriesPB,
+  // PB 工具
+  buildPBFileUrl,        // 统一用它拼出 {VITE_PB_BASE}/api/files/{collection}/{id}/{filename}
+  formatUtcPlus8,        // 固定把 PB 的 UTC -> UTC+8
+  // 其他已有 hooks/api
   useInsight,
   getInsight,
   useClientStore,
@@ -52,21 +58,27 @@ function ReportScreen() {
   const selectedError = selectedQueries.find((q) => q.isError)?.error;
   const selectedDetails = selectedQueries.map((q) => q.data).filter(Boolean);
 
-  // —— 从 PB 取 report_memories（全量，按时间倒序）
+  // —— PB 直读：report_memories（全量或 store 内部已按你需要过滤）
   const memoriesQuery = useQuery({
     queryKey: ["report_memories_pb_all"],
     queryFn: getReportMemoriesPB,
   });
+
+  // 统一字段 & 预先生成下载 URL（用 buildPBFileUrl）
   const memories = useMemo(() => {
     const arr = Array.isArray(memoriesQuery.data) ? memoriesQuery.data : [];
-    // 统一字段：id/title/docx_path/updated/created
-    return arr.map((r) => ({
-      id: r.id,
-      title: r.title || "(未命名)",
-      docx_path: r.docx_path || "",
-      updated: r.updated || r.created || "",
-      created: r.created || "",
-    }));
+    return arr.map((r) => {
+      const url = buildPBFileUrl(r); // {VITE_PB_BASE}/api/files/{collectionName}/{id}/{docx}
+      return {
+        id: r.id,
+        title: r.title || "(未命名)",
+        docx: r.docx || "",
+        docx_url: url || "",
+        collectionName: r.collectionName || "report_memories",
+        updated: r.updated || r.created || "",
+        created: r.created || "",
+      };
+    });
   }, [memoriesQuery.data]);
 
   // —— 选择的记忆ID（“应用修改”的基底）
@@ -135,16 +147,16 @@ function ReportScreen() {
     if (!localComment.trim() || !selectedMemoryId) return;
     reviseMut.mutate({
       insight_id: params.insight_id,          // 用于上传 docx 的目标 insight
-      memory_id: selectedMemoryId,            // 关键：指定基底记忆
+      memory_id: selectedMemoryId,            // 指定基底记忆
       comment: localComment.trim(),
       insight_ids_for_footer: selectedIds.length ? selectedIds : undefined,
     });
   }
 
-  // —— 下载链接：用“所选历史报告”的 docx_path
+  // —— 下载链接：用“所选历史报告”的 docx_url（用 buildPBFileUrl 生成）
   const currentDownload = useMemo(() => {
     const m = memories.find((x) => x.id === selectedMemoryId);
-    return m?.docx_path ? { url: m.docx_path, filename: m.title } : null;
+    return m?.docx_url ? { url: m.docx_url, filename: m.docx || m.title } : null;
   }, [memories, selectedMemoryId]);
 
   return (
@@ -207,16 +219,16 @@ function ReportScreen() {
                 <div className="flex-1 min-w-0">
                   <div className="font-medium truncate">{m.title}</div>
                   <div className="text-xs text-slate-500 mt-0.5">
-                    更新时间：{m.updated || "-"}
+                    更新时间：{formatUtcPlus8(m.updated)}
                   </div>
-                  {m.docx_path && (
+                  {m.docx_url && (
                     <a
                       className="text-sm text-blue-600 hover:underline break-all"
-                      href={m.docx_path}
+                      href={m.docx_url}
                       target="_blank"
                       rel="noreferrer"
                     >
-                      下载 DOCX
+                      {m.docx || "下载 DOCX"}
                     </a>
                   )}
                 </div>
@@ -271,21 +283,6 @@ function ReportScreen() {
         )}
       </div>
 
-      {/* 下载区：多选时仅在“本次运行后”显示，以防展示旧结果；单条则始终可见 */}
-      {(() => {
-        const canShow = !!currentDownload && (!idsParam ? true : justRanSig === currentSig);
-        return !isBusy && canShow;
-      })() && (
-        <div className="grid gap-1.5 max-w-screen-md border rounded px-4 py-2 pb-6">
-          <p className="my-4">报告可下载</p>
-          <p className="bg-slate-100 px-4 py-2 hover:underline flex gap-2 items-center overflow-hidden">
-            <FileDown className="h-4 w-4 text-slate-400" />
-            <a className="truncate" href={currentDownload.url} target="_blank" rel="noreferrer">
-              {currentDownload.filename}
-            </a>
-          </p>
-        </div>
-      )}
 
       {/* 错误显示 */}
       {query.isError && <p className="text-red-500 my-4">{query.error.message}</p>}

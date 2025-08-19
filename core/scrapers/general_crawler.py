@@ -23,13 +23,21 @@ import os
 from typing import Union
 from requests.compat import urljoin
 from scrapers import scraper_map
+from pathlib import Path
+from dotenv import load_dotenv
+from .new_llm_crawler import smart_crawler
+
+# 找到上层目录（例如上一级或两级，按实际调整）
+ROOT = Path(__file__).resolve().parents[2]  
+load_dotenv(ROOT / ".env", override=True)
+
 
 ONCLICK_URL_RE = re.compile(
     r"""(?:window\.open|location\.href\s*=|open)\s*\(\s*['"](?P<u>[^'"]+)['"]""",
     re.I
 )
 
-model = os.environ.get('HTML_PARSE_MODEL', 'gpt-4o-mini-2024-07-18')
+model = os.environ.get('HTML_PARSE_MODEL', 'DeepSeek-V3')
 header = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/604.1 Edg/112.0.100.0'}
 extractor = GeneralNewsExtractor()
@@ -85,11 +93,11 @@ from typing import Optional
 
 from urllib.parse import urlsplit
 
-# 顶部常量区域（与 MIN_LIST_LINKS 同级）
 DETAIL_PATTERNS = [
-    re.compile(r"/t\d{8}_\d+\.html$"),          # .../t20250327_325028.html
-    re.compile(r"/\d{6,8}/t\d{8}_\d+\.html$"),  # .../202503/t20250327_325028.html
-    re.compile(r"/content_\d+\.html$"),         # .../content_123456.html（常见）
+    re.compile(r"/t\d{8}_\d+\.html$"),
+    re.compile(r"/\d{6,8}/t\d{8}_\d+\.html$"),
+    re.compile(r"/content_\d+\.html$"),
+    re.compile(r"/\d{4}(?:\d{2})?/\d{2}/[0-9a-f-]{8,}\.html$"),  # like .../202505/30/uuid.html
 ]
 
 try:
@@ -130,7 +138,7 @@ async def _fetch(url: str, logger) -> Tuple[httpx.Response, str]:
                     url,
                     headers=header,
                     timeout=REQUEST_TIMEOUT,
-                    follow_redirects=True,  # ✅ 修复 301/302
+                    follow_redirects=True,  # 修复 301/302
                 )
                 resp.raise_for_status()
                 final_url = str(resp.url)
@@ -158,7 +166,7 @@ def _normalize_encoding(enc: Optional[str]) -> Optional[str]:
     if e in {"utf8", "utf-8", "utf_8"}:
         return "utf-8"
     if e in {"gbk", "gb2312", "gb-2312", "gb_2312-80", "gb-18030", "gb18030"}:
-        return "gb18030"  # ✅ 用最全的 gb18030
+        return "gb18030"  # 用最全的 gb18030
     if e in {"cp936"}:
         return "cp936"
     if e in {"big5", "big-5"}:
@@ -607,6 +615,8 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
     init_domain = parsed_url.netloc
     if init_domain in scraper_map:
         return await scraper_map[init_domain](url, logger)
+    
+    # return await smart_crawler(url, logger)
 
     # 1) 抓页面（自动跟随重定向）；若失败 -> -7
     try:
@@ -638,7 +648,7 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
     if js_links:
         article_links |= js_links
     # 仅当“新闻候选”达到阈值才视为列表页（比如 8，按需调小/调大）
-    NEWS_LIST_MIN = 4
+    NEWS_LIST_MIN = 8
     if len(article_links) >= NEWS_LIST_MIN or _is_list_like_page(soup):
         if len(article_links) >= NEWS_LIST_MIN:
             logger.info(f"{final_url} detected as news list page, found {len(article_links)} news-like links")
@@ -775,3 +785,6 @@ async def general_crawler(url: str, logger) -> Tuple[int, Union[Set[str], Dict]]
     result["url"] = final_url
 
     return 11, result
+
+
+

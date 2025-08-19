@@ -152,6 +152,67 @@ export function getReportMemoriesPB() {
   });
 }
 
+const PB_BASE = (import.meta.env.VITE_PB_BASE || "").replace(/\/+$/, "");
+
+// 统一按你的“完美URL”规则拼链接；withToken 可按需开启
+export function buildPBFileUrl(record, withToken = false) {
+  if (!record?.docx) return "";
+  const coll = record.collectionName || "report_memories"; // 兜底集合名
+  const url = `${PB_BASE}/api/files/${coll}/${record.id}/${encodeURIComponent(
+    record.docx
+  )}`;
+  return withToken && pb?.authStore?.token ? `${url}?token=${pb.authStore.token}` : url;
+}
+
+// 过滤字符串里的双引号（便于 getFirstListItem 过滤）
+function escQuotes(s = "") {
+  return String(s).replace(/"/g, '\\"');
+}
+
+/**
+ * A. 按 docx 文件名解析一条 report_memories 记录并给出下载链接
+ * @param {string} docxName 例如 "中核日报（2025-08-18）.docx"
+ * @param {object} opts 可选过滤条件，如 { titleHint }
+ * @returns {Promise<{record, url}>}
+ */
+export async function resolveMemoryByDocx(docxName, opts = {}) {
+  if (!docxName) return { record: null, url: "" };
+
+  // 先尝试精确匹配 docx；必要时可叠加 title 条件，避免重名
+  const filter = [
+    `docx="${escQuotes(docxName)}"`,
+    opts.titleHint ? `title~"${escQuotes(opts.titleHint)}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" && ");
+
+  // getFirstListItem 会按 filter 找到第一条；我们再按 -updated 拿最新的
+  const rec = await pb
+    .collection("report_memories")
+    .getFirstListItem(filter, {
+      fields: "id,title,docx,created,updated,collectionId,collectionName",
+      sort: "-updated",
+    })
+    .catch(() => null);
+
+  if (!rec) return { record: null, url: "" };
+  return { record: rec, url: buildPBFileUrl(rec) };
+}
+
+/**
+ * B. 获取最新的一条 report_memories 记录并给出下载链接
+ * @returns {Promise<{record, url}>}
+ */
+export async function resolveLatestMemory() {
+  const page = await pb.collection("report_memories").getList(1, 1, {
+    sort: "-updated",
+    fields: "id,title,docx,created,updated,collectionId,collectionName",
+  });
+  const rec = page?.items?.[0] || null;
+  return { record: rec, url: rec ? buildPBFileUrl(rec) : "" };
+}
+
+
 export function more({ insight_id }) {
   return axios({
     method: "post",
@@ -306,4 +367,19 @@ export function unlinkArticle({ insight_id, article_id }) {
   return pb.collection("insights").update(insight_id, {
     "articles-": article_id,
   })
+}
+
+export function formatUtcPlus8(iso) {
+  if (!iso) return "-";
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return iso;
+  const d = new Date(ms + 8 * 60 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  const Y = d.getUTCFullYear();
+  const M = pad(d.getUTCMonth() + 1);
+  const D = pad(d.getUTCDate());
+  const h = pad(d.getUTCHours());
+  const m = pad(d.getUTCMinutes());
+  const s = pad(d.getUTCSeconds());
+  return `${Y}-${M}-${D} ${h}:${m}:${s}`;
 }

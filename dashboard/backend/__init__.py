@@ -17,90 +17,6 @@ load_dotenv(ROOT / ".env", override=True)
 PB_BASE_URL = os.environ.get("PB_BASE_URL", "").rstrip("/")
 
 
-# ---- PB 辅助：获取 insights.docx 的下载 URL ----
-def _resolve_docx_url_from_insights(anchor_id: str) -> str:
-    """
-    读取 insights 记录，尽力从 docx 字段解析出可下载链接。
-    兼容几种返回形态：字符串文件名 / 完整URL / dict/list。
-    """
-    try:
-        recs = pb.read("insights", fields=["id", "docx"], filter=f'id="{anchor_id}"')
-        if not recs or not recs[0]:
-            return ""
-        docx_field = recs[0].get("docx")
-        # 1) 已是完整 URL
-        if isinstance(docx_field, str) and docx_field.startswith("http"):
-            return docx_field
-        # 2) 仅是文件名，尝试用 pb_api 的便捷方法
-        if isinstance(docx_field, str) and docx_field:
-            # 若 pb_api 暴露了 file_url/get_file_url 之类方法，优先使用
-            for attr in ("file_url", "get_file_url", "get_download_url"):
-                if hasattr(pb, attr):
-                    try:
-                        return getattr(pb, attr)("insights", anchor_id, docx_field)
-                    except Exception:
-                        pass
-            # 兜底：按 PocketBase 规范拼 URL
-            if PB_BASE_URL:
-                return f"{PB_BASE_URL}/api/files/insights/{anchor_id}/{docx_field}"
-            return ""
-        # 3) dict/list 里找 url 字段
-        if isinstance(docx_field, dict):
-            return docx_field.get("url") or docx_field.get("downloadUrl") or ""
-        if isinstance(docx_field, list) and docx_field:
-            item = docx_field[0]
-            if isinstance(item, str) and item.startswith("http"):
-                return item
-            if isinstance(item, dict):
-                return item.get("url") or item.get("downloadUrl") or ""
-    except Exception as e:
-        logger.warning(f"_resolve_docx_url_from_insights error: {e}")
-    return ""
-
-
-# ---- PB：保存一条报告记忆 ----
-def _save_report_memory_to_pb(anchor_id: str, title: str, snapshot_text: str,
-                              docx_filename: str, docx_url: str) -> str:
-    body = {
-        "anchor_id": anchor_id,
-        "title": title,
-        "snapshot": snapshot_text,
-        "docx_filename": docx_filename,
-        "docx_url": docx_url,
-        "created": datetime.now().isoformat(timespec="seconds"),
-        "updated": datetime.now().isoformat(timespec="seconds"),
-    }
-    try:
-        rec_id = pb.add(collection_name="report_memories", body=body)
-        return str(rec_id or "")
-    except Exception as e:
-        logger.warning(f"save report memory failed: {e}")
-        return ""
-
-
-# ---- PB：读取某 anchor 最新一条记忆（按 updated/created 选最近） ----
-def _get_latest_report_memory_from_pb(anchor_id: str) -> dict | None:
-    try:
-        recs = pb.read(collection_name="report_memories",
-                       fields=["id", "anchor_id", "title", "snapshot",
-                               "docx_filename", "docx_url", "created", "updated"],
-                       filter=f'anchor_id="{anchor_id}"')
-        if not recs:
-            return None
-        # 选择更新最晚的一条
-        def _ts(r):
-            t = r.get("updated") or r.get("created") or ""
-            try:
-                return datetime.fromisoformat(t.replace("Z", "+00:00"))
-            except Exception:
-                return datetime.min
-        recs.sort(key=_ts, reverse=True)
-        return recs[0]
-    except Exception as e:
-        logger.warning(f"read latest report memory failed: {e}")
-        return None
-
-
 # ========== 后端服务 ==========
 class BackendService:
     def __init__(self):
@@ -239,8 +155,7 @@ class BackendService:
         for iid in insight_ids:
             rec = pb.read(
                 "insights",
-                # 注意多取一个 url 字段，作为洞见的“源链接”
-                fields=["id", "content", "tag", "keywords", "articles", "url", "docx"],
+                fields=["id", "content", "tag", "articles", "url", "docx", "category"],
                 filter=f'id="{iid}"',
             )
             if rec and rec[0]:
@@ -261,7 +176,7 @@ class BackendService:
         for aid in article_ids:
             rec = pb.read(
                 "articles",
-                fields=["id", "title", "abstract", "content", "url", "publish_time"],
+                fields=["id", "title", "abstract", "content", "url", "publish_time", "category"],
                 filter=f'id="{aid}"',
             )
             if rec and rec[0]:
