@@ -30,6 +30,8 @@ from general_utils import get_logger_level
 # OpenAI 客户端（兼容自定义 base_url 或仅 api_key）
 from openai import OpenAI, RateLimitError
 
+from datetime import datetime
+
 
 # ========== 环境 & 客户端 ==========
 ROOT = Path(__file__).resolve().parents[2]
@@ -60,6 +62,22 @@ logger.add(
 )
 
 pb = PbTalker(logger)
+
+def log_tokens(model: str, purpose: str, total_tokens: int):
+    """
+    写一条消费记录到 PB.tokens_consume
+    """
+    body = {
+        "model": model,
+        "purpose": purpose,
+        "total_tokens": int(total_tokens or 0),
+    }
+    try:
+        rec_id = pb.add(collection_name="tokens_consume", body=body)
+        return rec_id
+    except Exception as e:
+        print(f"[tokens_consume] write failed: {e}")
+        return None
 
 # LLM & 输入大小提示（可根据所用模型调整）
 REPORT_MODEL = os.environ.get("REPORT_MODEL", "gpt-4o-mini-2024-07-18")
@@ -110,6 +128,30 @@ def safe_filename(name: str) -> str:
     name = re.sub(r"\s+", " ", name)
     return name or f"中核日报（{cn_today_str()}）"
 
+# 放在 openai_llm 文件顶部或函数内均可
+def _read_usage_total(usage) -> int:
+    """
+    兼容 OpenAI SDK 的 dict 或对象（CompletionUsage）两种形态
+    返回 total_tokens；若为空则用 prompt+completion 求和
+    """
+    if not usage:
+        return 0
+
+    def _read(name: str) -> int:
+        try:
+            # dict 形态
+            if isinstance(usage, dict):
+                return int(usage.get(name, 0) or 0)
+            # 对象形态
+            return int(getattr(usage, name, 0) or 0)
+        except Exception:
+            return 0
+
+    total = _read("total_tokens")
+    if total:
+        return total
+    return _read("prompt_tokens") + _read("completion_tokens")
+
 
 def openai_llm(messages: list, model: str, logger_=None, **kwargs) -> str:
     """
@@ -151,6 +193,11 @@ def openai_llm(messages: list, model: str, logger_=None, **kwargs) -> str:
                 logger_.debug(f"result:\n {resp.choices[0]}")
                 if getattr(resp, "usage", None):
                     logger_.debug(f"usage:\n {resp.usage}")
+            
+            usage = getattr(resp, "usage", None)
+            total = _read_usage_total(usage)
+            log_tokens(model=model, purpose="报告生成", total_tokens=total)
+
             return resp.choices[0].message.content
         except Exception as e:
             last_err = e
@@ -697,7 +744,7 @@ def _pb_file_url(collection: str, record_id: str, filename: str) -> str:
     """
     if not (PB_BASE_URL and collection and record_id and filename):
         return ""
-    return f"{PB_BASE_URL}/api/files/{collection}/{record_id}/{filename}"
+    return f"{d:\buff\serve.py}/api/files/{collection}/{record_id}/{filename}"
 
 def _save_report_memory(title: str, snapshot_text: str, docx_local_path: str) -> tuple[str, str]:
     """
@@ -1123,6 +1170,11 @@ def build_docx_from_snapshot(snapshot_text: str,
 
     url_line_pat = re.compile(r"^(https?://[^\s]+)$")
 
+    # 统一把“1、/1，/1) /1．/1.”等规范为“1. 标题”
+    num_title_pat = re.compile(r"^(\d+)\s*[、，\.\.．\)）]\s*(.+)$")
+    # 兼容“1 空格 标题”这种写法
+    num_title_loose_pat = re.compile(r"^(\d+)\s+(.+)$")
+
     i = 1
     while i < len(lines):
         stripped = (lines[i] or "").strip()
@@ -1150,10 +1202,20 @@ def build_docx_from_snapshot(snapshot_text: str,
             i += 1
             continue
 
-        # 编号标题行
-        if re.match(r"^\d+，", stripped):
+        # 【编号标题行】 → 规范为 “N. 标题”
+        m_num = num_title_pat.match(stripped)
+        if m_num:
+            num, rest = m_num.group(1), m_num.group(2).strip()
             p = doc.add_paragraph()
-            p.add_run(stripped)
+            p.add_run(f"{num}. {rest}")
+            i += 1
+            continue
+        # 宽松匹配：如“1 标题”
+        m_num_loose = num_title_loose_pat.match(stripped)
+        if m_num_loose:
+            num, rest = m_num_loose.group(1), m_num_loose.group(2).strip()
+            p = doc.add_paragraph()
+            p.add_run(f"{num}. {rest}")
             i += 1
             continue
 
@@ -1175,10 +1237,11 @@ def build_docx_from_snapshot(snapshot_text: str,
             title_a = a.get("title", "")
             url_a = a.get("url", "")
             d = _norm_date(a.get("publish_time", ""))
-            doc.add_paragraph(f"{k}、{title_a}|{d}")
+            doc.add_paragraph(f"{k}.{title_a}|{d}")
             p2 = doc.add_paragraph()
             if url_a:
                 add_hyperlink(p2, url_a, url_a)
 
     doc.save(docx_file)
     return True
+

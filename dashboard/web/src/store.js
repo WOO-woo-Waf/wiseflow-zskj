@@ -19,7 +19,7 @@ export const useClientStore = create(
       taskId: "",
       urls: ["https://cyberscoop.com"],
       days: 14,
-      workflow_name: "情报分析",
+      workflow_name: "鹰眼AI头条",
       toc: ["参考情报", "基本内容", "相关发声情况", "应对策略"],
       selectedInsight: null,
       comment: "",
@@ -43,14 +43,108 @@ export const useClientStore = create(
   )
 )
 
-export function login({ username, password }) {
-  //return pb.collection("users").authWithPassword(username, password)
-  return pb.admins.authWithPassword(username, password)
+/** 登录：先尝试管理员，再尝试普通用户（users 集合） */
+export async function login({ username, password }) {
+  // 1) 管理员登录
+  try {
+    const admin = await pb.admins.authWithPassword(username, password);
+    // 标记角色
+    localStorage.setItem("authRole", "admin");
+    return admin;
+  } catch (e1) {
+    // 2) 普通用户登录（users 集合；PocketBase 标准邮箱密码登录）
+    try {
+      const user = await pb.collection("users").authWithPassword(username, password);
+      localStorage.setItem("authRole", "user");
+      return user;
+    } catch (e2) {
+      // 统一抛出更友好的错误
+      const msg =
+        (e2?.data && (e2.data.message || e2.data.error)) ||
+        e2?.message ||
+        e1?.message ||
+        "登录失败：请检查账号或密码";
+      throw new Error(msg);
+    }
+  }
 }
 
 export function isAuth() {
-  return pb.authStore.isValid
+  return pb.authStore.isValid;
 }
+
+export function getAuthRole() {
+  return localStorage.getItem("authRole") || "guest";
+}
+
+export function isAdmin() {
+  return getAuthRole() === "admin";
+}
+
+export function isUser() {
+  return getAuthRole() === "user";
+}
+
+/** 退出登录：清理 PB 会话与角色标记 */
+export function logout() {
+  try {
+    pb.authStore.clear();
+    localStorage.removeItem("authRole");
+    // 如需清理你的 zustand 持久化，可在此追加：
+    // useClientStore.persist.clearStorage();
+  } catch {}
+}
+
+/** 创建新用户（users 集合）：email + password */
+export async function registerUser({ email, password }) {
+  // PB 的标准字段：email, password, passwordConfirm
+  const body = { email, password, passwordConfirm: password };
+  const rec = await pb.collection("users").create(body);
+  // 如需发验证邮件可以启用（PB 默认提供）：
+  // await pb.collection("users").requestVerification(email);
+  return rec;
+}
+
+
+// 通用 CRUD（如果你已加过 listAll/createOne/deleteOne 可复用）
+export function listAll(collection, { sort = "-created", filter } = {}) {
+  return pb.collection(collection).getFullList({ sort, ...(filter ? { filter } : {}) });
+}
+export function createOne(collection, body) {
+  return pb.collection(collection).create(body);
+}
+export function updateOne(collection, id, body) {
+  return pb.collection(collection).update(id, body);
+}
+export function deleteOne(collection, id) {
+  return pb.collection(collection).delete(id);
+}
+
+// ---- Sites ----
+export function useSites() {
+  return useQuery({ queryKey: ["sites"], queryFn: () => listAll("sites") });
+}
+export const addSite = ({ url, per_hours, within_days, activated = true, category = "" }) =>
+  createOne("sites", { url, per_hours, within_days, activated, category });
+export const saveSite = (id, body) => updateOne("sites", id, body);
+export const removeSite = (id) => deleteOne("sites", id);
+
+/** ---------- Tags ---------- **/
+export function useTags() {
+  return useQuery({ queryKey: ["tags"], queryFn: () => listAll("tags") });
+}
+
+// 新增标签：name 必填，其余给默认值
+export const addTag = ({ name, activated = true, explaination = "" }) =>
+  createOne("tags", { name, activated, explaination });
+
+// 更新标签：按需传入要改的字段
+export const saveTag = (id, body) => updateOne("tags", id, body);
+
+// 删除
+export const removeTag = (id) => deleteOne("tags", id);
+
+
 
 export function useData(task_id, autoRefetch = undefined) {
   let interval = parseInt(autoRefetch) >= 1000 ? parseInt(autoRefetch) : undefined
@@ -102,6 +196,35 @@ export function createTask({ id, urls, days }) {
       return error
     })
 }
+
+/** ---------- Tokens 消费 读取与聚合 ---------- **/
+
+// 读取 tokens_consume（可选时间窗）
+export function getTokensConsume({ from, to } = {}) {
+  const filters = [];
+  if (from) filters.push(`created >= "${from}"`);
+  if (to)   filters.push(`created < "${to}"`);
+  const filter = filters.join(" && ");
+
+  return pb.collection("tokens_consume").getFullList({
+    sort: "-created",
+    ...(filter ? { filter } : {}),
+    // 可加 fields 精简：fields: "id,created,model,purpose,total_tokens"
+  });
+}
+
+export function calcTokensTotal(items = []) {
+  return items.reduce((sum, it) => sum + Number(it.total_tokens || 0), 0);
+}
+
+export function useTokensConsume(opts = {}) {
+  return useQuery({
+    queryKey: ["tokens_consume", opts],
+    queryFn: () => getTokensConsume(opts),
+  });
+}
+
+
 
 // 首次生成：POST /report/generate
 export function generateReport({ insight_id, toc, insight_ids }) {

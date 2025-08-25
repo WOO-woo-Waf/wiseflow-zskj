@@ -23,6 +23,49 @@ elif not base_url and token:
 else:
     client = OpenAI(api_key=token, base_url=base_url)
 
+# 放在 openai_llm 文件顶部或函数内均可
+def _read_usage_total(usage) -> int:
+    """
+    兼容 OpenAI SDK 的 dict 或对象（CompletionUsage）两种形态
+    返回 total_tokens；若为空则用 prompt+completion 求和
+    """
+    if not usage:
+        return 0
+
+    def _read(name: str) -> int:
+        try:
+            # dict 形态
+            if isinstance(usage, dict):
+                return int(usage.get(name, 0) or 0)
+            # 对象形态
+            return int(getattr(usage, name, 0) or 0)
+        except Exception:
+            return 0
+
+    total = _read("total_tokens")
+    if total:
+        return total
+    return _read("prompt_tokens") + _read("completion_tokens")
+
+
+
+def log_tokens(model: str, purpose: str, total_tokens: int):
+    """
+    写一条消费记录到 PB.tokens_consume
+    """
+    from insights.get_info import pb  
+    body = {
+        "model": model,
+        "purpose": purpose,
+        "total_tokens": int(total_tokens or 0),
+    }
+    try:
+        rec_id = pb.add(collection_name="tokens_consume", body=body)
+        return rec_id
+    except Exception as e:
+        print(f"[tokens_consume] write failed: {e}")
+        return None
+
 
 def openai_llm(messages: list, model: str, logger=None, **kwargs) -> str:
     if logger:
@@ -47,5 +90,10 @@ def openai_llm(messages: list, model: str, logger=None, **kwargs) -> str:
     if logger:
         logger.debug(f'result:\n {response.choices[0]}')
         logger.debug(f'usage:\n {response.usage}')
+    
+    usage = getattr(response, "usage", None)
+    total = _read_usage_total(usage)
+    log_tokens(model=model, purpose="文本摘要/处理", total_tokens=total)
+
 
     return response.choices[0].message.content
