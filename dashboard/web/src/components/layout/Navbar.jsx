@@ -35,7 +35,7 @@ export default function Navbar() {
             <img
               src={logo}
               alt="Logo"
-              className="h-36 w-auto object-contain" 
+              className="h-24 w-auto object-contain" 
               // h-8 = 2rem 高度（大约 32px）
               // w-auto = 宽度自适应
               // max-h-8 避免撑开

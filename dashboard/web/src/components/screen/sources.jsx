@@ -154,15 +154,15 @@ export default function SourcesScreen() {
           <h3 className="font-semibold">添加网站</h3>
           <div className="grid md:grid-cols-4 gap-3">
             <div className="md:col-span-2">
-              <Label className="mb-1 block">URL</Label>
+              <Label className="mb-1 block">网址</Label>
               <Input value={siteForm.url} onChange={(e) => setSiteForm((p)=>({ ...p, url: e.target.value }))} placeholder="https://example.com" />
             </div>
             <div>
-              <Label className="mb-1 block">per_hours</Label>
+              <Label className="mb-1 block">间隔时长（小时）</Label>
               <Input type="number" value={siteForm.per_hours} onChange={(e) => setSiteForm((p)=>({ ...p, per_hours: Number(e.target.value) }))} />
             </div>
             <div>
-              <Label className="mb-1 block">within_days</Label>
+              <Label className="mb-1 block">爬取内容时间范围（天）</Label>
               <Input type="number" value={siteForm.within_days} onChange={(e) => setSiteForm((p)=>({ ...p, within_days: Number(e.target.value) }))} />
             </div>
             <div>

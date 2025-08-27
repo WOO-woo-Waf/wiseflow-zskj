@@ -1,49 +1,63 @@
-// InsightsScreen.jsx  —— 支持“多天选择 + 跨天合并生成报告 + 标签筛选”
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import { useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Files } from "lucide-react";
-
+import { useNavigate } from "react-router-dom";
 import { ArticleList } from "@/components/article-list";
 import { Button } from "@/components/ui/button";
-import { ButtonLoading } from "@/components/ui/button-loading";
 import { Toaster } from "@/components/ui/toaster";
 import { useToast } from "@/components/ui/use-toast";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 
-// 这些按你的项目实际路径调整
 import {
   getInsights,
   getInsightDates,
   useClientStore,
   unlinkArticle,
   more,
-  // 👇 新增：引入 useTags
   useTags,
 } from "@/store";
 
 /** ---------- 工具 ---------- */
-// 统一把 tag 字段变成 id 数组（兼容 string / array / null）
 function normalizeTagIds(tagField) {
   if (tagField == null) return [];
   if (Array.isArray(tagField)) return tagField.filter(Boolean).map(String);
   return [String(tagField)];
 }
 
-/** ---------- 多选日期控件 ---------- */
+function formatYMD(date, tz = "America/Los_Angeles") {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function enumerateDates(startYmd, endYmd) {
+  if (!startYmd || !endYmd) return [];
+  const start = new Date(`${startYmd}T00:00:00`);
+  const end = new Date(`${endYmd}T00:00:00`);
+  if (isNaN(start) || isNaN(end) || start > end) return [];
+  const days = [];
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    days.push(formatYMD(d));
+  }
+  return days;
+}
+
+/** ---------- 多选日期控件（保留） ---------- */
 function DateMultiPicker({ dates, selected, onChange }) {
   function toggle(d, checked) {
-    onChange(checked ? Array.from(new Set([...selected, d])) : selected.filter((x) => x !== d));
+    const next = checked
+      ? Array.from(new Set([...selected, d]))
+      : selected.filter((x) => x !== d);
+    onChange(next);
   }
   return (
     <div className="flex flex-wrap gap-2">
       {dates.map((d) => (
         <label key={d} className="flex items-center gap-1 text-sm border rounded px-2 py-1 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={selected.includes(d)}
-            onChange={(e) => toggle(d, e.target.checked)}
-          />
+          <input type="checkbox" checked={selected.includes(d)} onChange={(e) => toggle(d, e.target.checked)} />
           {d}
         </label>
       ))}
@@ -51,12 +65,20 @@ function DateMultiPicker({ dates, selected, onChange }) {
   );
 }
 
-/** ---------- 多天洞见并发拉取并合并 ---------- */
+/** ---------- 并发拉取并合并 ---------- */
 function useInsightsMulti(selectedDates) {
   const queries = useQueries({
     queries: (selectedDates || []).map((d) => ({
       queryKey: ["insights", d],
-      queryFn: () => getInsights(d),
+      queryFn: async () => {
+        try {
+          return await getInsights(d);
+        } catch (err) {
+          // 兼容 PocketBase auto-cancel：返回空即可
+          if (err?.isAbort || err?.status === 0) return [];
+          throw err;
+        }
+      },
       enabled: !!d,
       staleTime: 60_000,
     })),
@@ -66,7 +88,6 @@ function useInsightsMulti(selectedDates) {
   const isError = queries.some((q) => q.isError);
   const errorObj = queries.find((q) => q.error)?.error;
 
-  // 合并各天结果，按 created 倒序（与 getInsights 保持一致）
   const data = useMemo(() => {
     const list = queries.map((q) => (Array.isArray(q.data) ? q.data : [])).flat();
     return list.sort((a, b) => (a.created > b.created ? -1 : 1));
@@ -76,20 +97,7 @@ function useInsightsMulti(selectedDates) {
 }
 
 /** ---------- 列表 ---------- */
-function List({
-  insights,
-  selected,
-  selectedIds,
-  onToggleSelect,
-  onOpen,
-  onDelete,
-  onReport,
-  onMore,
-  isGettingMore,
-  error,
-  // 👇 新增：用于把 id 映射为标签名
-  tagIdToName,
-}) {
+function List({ insights, selected, selectedIds, onToggleSelect, onOpen, onDelete, onMore, error, tagIdToName }) {
   function change(value) {
     if (value) onOpen(value);
   }
@@ -120,14 +128,10 @@ function List({
                   <p className={"truncate text-wrap " + (selected === insight.id ? "font-bold" : "font-normal")}>
                     {insight.content}
                   </p>
-                  {/* 👇 新增：在标题下方小字展示标签名 */}
                   {tagNames.length > 0 && (
                     <div className="mt-1 flex flex-wrap gap-1">
                       {tagNames.map((name) => (
-                        <span
-                          key={name}
-                          className="text-[11px] px-2 py-[2px] rounded-full bg-gray-100 text-gray-600 border"
-                        >
+                        <span key={name} className="text-[11px] px-2 py-[2px] rounded-full bg-gray-100 text-gray-600 border">
                           {name}
                         </span>
                       ))}
@@ -136,18 +140,13 @@ function List({
                 </div>
                 <div className="flex items-center justify-center gap-1">
                   <Files className="h-4 w-4 text-slate-400" />
-                  <span className="text-slate-400 text-sm leading-none">
-                    x {insight.expand?.articles?.length ?? 0}
-                  </span>
+                  <span className="text-slate-400 text-sm leading-none">x {insight.expand?.articles?.length ?? 0}</span>
                 </div>
               </div>
             </AccordionTrigger>
             <AccordionContent className="px-4">
               <ArticleList data={insight.expand?.articles ?? []} showActions={true} onDelete={unlink} />
               {error && <p className="text-red-500 my-4">{error.message}</p>}
-              <div className="mt-2 flex gap-2">
-                <Button variant="outline" size="sm" onClick={onReport}>生成单条报告</Button>
-              </div>
             </AccordionContent>
           </AccordionItem>
         );
@@ -156,30 +155,29 @@ function List({
   );
 }
 
-/** ---------- 主页面 ---------- */
+/** ---------- 主页面（选择版） ---------- */
 export default function InsightsScreen() {
   const [selectedIds, setSelectedIds] = useState([]);
-  const [selectedDates, setSelectedDates] = useState([]); // ✅ 多天选择
+  const [selectedDates, setSelectedDates] = useState([]);
   const selectedInsight = useClientStore((s) => s.selectedInsight);
   const selectInsight = useClientStore((s) => s.selectInsight);
-
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { toast } = useToast();
 
-  // 可选日期
+  // 所有可选日期
   const [allDates, setAllDates] = useState([]);
   useEffect(() => {
     getInsightDates().then((ds) => {
       setAllDates(ds || []);
-      if ((ds || []).length && selectedDates.length === 0) setSelectedDates([ds[0]]); // 默认选最近一天
+      if ((ds || []).length && selectedDates.length === 0) setSelectedDates([ds[0]]);
     });
   }, []);
 
-  // 并发拉取 & 合并
+  // 数据
   const { data, isLoading, error } = useInsightsMulti(selectedDates);
 
-  // ===== 新增：读取 tags 集合 & 映射 id->name =====
+  // 标签
   const tagsQuery = useTags();
   const tagIdToName = useMemo(() => {
     const map = new Map();
@@ -187,42 +185,24 @@ export default function InsightsScreen() {
     return map;
   }, [tagsQuery.data]);
 
-  // ===== 新增：标签筛选（chips）
   const [selectedTagIds, setSelectedTagIds] = useState([]);
   const allTagItems = useMemo(() => {
     const items = (tagsQuery.data || []).map((t) => ({ id: String(t.id), name: String(t.name ?? t.id) }));
     return items.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"));
   }, [tagsQuery.data]);
 
-  // 删除文章
-  const mutUnlink = useMutation({
-    mutationFn: (params) => {
-      if (params && selectedInsight) {
-        const insight = data.find((i) => i.id === selectedInsight);
-        if (insight && (insight.expand?.articles?.length ?? 0) === 1) {
-          throw new Error("不能删除最后一篇文章");
-        }
-      }
-      return unlinkArticle(params);
-    },
-    onSuccess: () => {
-      selectedDates.forEach((d) => queryClient.invalidateQueries({ queryKey: ["insights", d] }));
-    },
-    onError: (e) => {
-      toast({ variant: "destructive", title: "出错啦！", description: e?.message || "操作失败" });
-    },
-  });
-
-  // “更多”
-  const mutMore = useMutation({
-    mutationFn: (params) => more(params),
-    onSuccess: () => {
-      selectedDates.forEach((d) => queryClient.invalidateQueries({ queryKey: ["insights", d] }));
-    },
-    onError: (e) => {
-      toast({ variant: "destructive", title: "出错啦！", description: e?.message || "加载失败" });
-    },
-  });
+  // 日期范围
+  const [rangeStart, setRangeStart] = useState("");
+  const [rangeEnd, setRangeEnd] = useState("");
+  function applyRange() {
+    const range = enumerateDates(rangeStart, rangeEnd);
+    if (!range.length) {
+      toast({ title: "时间范围无效", description: "请检查开始和结束日期", variant: "destructive" });
+      return;
+    }
+    const merged = Array.from(new Set([...selectedDates, ...range])).sort().reverse();
+    setSelectedDates(merged);
+  }
 
   // 切换日期时清空选择
   useEffect(() => {
@@ -235,15 +215,103 @@ export default function InsightsScreen() {
     setSelectedIds((prev) => (checked ? (prev.includes(id) ? prev : [...prev, id]) : prev.filter((x) => x !== id)));
   }
 
-  function unlink(insight_id, article_id) {
-    mutUnlink.mutate({ insight_id, article_id });
+  // 删除文章 & 更多
+  function invalidate() {
+    selectedDates.forEach((d) => queryClient.invalidateQueries({ queryKey: ["insights", d] }));
   }
 
-  function reportSingle() {
-    if (!selectedInsight) return;
-    navigate(`/report/${selectedInsight}`);
+  const mutUnlink = useMutation({
+    mutationFn: (params) => {
+      if (params && selectedInsight) {
+        const insight = data.find((i) => i.id === selectedInsight);
+        if (insight && (insight.expand?.articles?.length ?? 0) === 1) {
+          throw new Error("不能删除最后一篇文章");
+        }
+      }
+      return unlinkArticle(params);
+    },
+    onSuccess: invalidate,
+    onError: (e) => {
+      toast({ variant: "destructive", title: "出错啦！", description: e?.message || "操作失败" });
+    },
+  });
+
+  const mutMore = useMutation({
+    mutationFn: (params) => more(params),
+    onSuccess: invalidate,
+    onError: (e) => {
+      toast({ variant: "destructive", title: "出错啦！", description: e?.message || "加载失败" });
+    },
+  });
+
+  // 过滤（按标签）
+  const filteredData = useMemo(() => {
+    if (!selectedTagIds.length) return data || [];
+    return (data || []).filter((ins) => {
+      const ids = normalizeTagIds(ins.tag);
+      return ids.some((id) => selectedTagIds.includes(String(id)));
+    });
+  }, [data, selectedTagIds]);
+
+  // 全选 / 反选 / 清空（针对可见列表）
+  function selectAllVisible() {
+    setSelectedIds((filteredData || []).map((i) => i.id));
   }
 
+  function invertSelection() {
+    setSelectedIds((prev) => {
+      const prevSet = new Set(prev);
+      const result = [];
+      (filteredData || []).forEach((i) => {
+        if (!prevSet.has(i.id)) result.push(i.id);
+      });
+      return result;
+    });
+  }
+
+  function clearSelection() {
+    setSelectedIds([]);
+  }
+
+  // 快捷日期（只改变日期集合，不触发生成）
+  function quickToday() {
+    const today = formatYMD(new Date());
+    if ((allDates || []).includes(today)) {
+      setSelectedDates([today]);
+    } else {
+      toast({ title: "今天没有内容", description: "已保持当前选择", variant: "destructive" });
+    }
+  }
+
+  function quickLast7Days() {
+    const end = new Date();
+    const recentDates = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(end);
+      d.setDate(end.getDate() - i);
+      recentDates.push(formatYMD(d));
+    }
+    const available = allDates || [];
+    const inWindow = recentDates.filter((d) => available.includes(d));
+    const finalDates = inWindow.length > 0 ? inWindow : available.slice(0, 7);
+    if (!finalDates.length) {
+      toast({ title: "暂无数据", description: "近7天以及历史均无可用日期", variant: "destructive" });
+      return;
+    }
+    setSelectedDates(Array.from(new Set(finalDates)));
+  }
+
+  // 统一生成（固定函数）
+  function handleGenerate() {
+    if (!selectedIds.length) {
+      toast({ title: "未选择洞见", description: "请先勾选至少一条洞见", variant: "destructive" });
+      return;
+    }
+    const ids = selectedIds.slice();
+    const anchor = ids[0];
+    const qs = `?ids=${encodeURIComponent(ids.join(","))}`;
+    navigate(`/report/${anchor}${qs}`);
+  }
   // 生成“勾选报告”（跨天）
   function reportSelected() {
     if (!selectedIds.length) {
@@ -255,44 +323,59 @@ export default function InsightsScreen() {
     navigate(`/report/${anchor}${qs}`);
   }
 
-  // 生成“所选日期全部洞见”（跨天）
-  function reportAllSelectedDays() {
-    const ids = (filteredData || []).map((i) => i.id); // 注意：按筛选后的集合生成
-    if (!ids.length) {
-      toast({ title: "暂无数据", description: "所选条件没有洞见", variant: "destructive" });
-      return;
-    }
-    const anchor = ids[0];
-    const qs = `?ids=${encodeURIComponent(ids.join(","))}`;
-    navigate(`/report/${anchor}${qs}`);
-  }
-
-  // ===== 新增：按标签过滤（与多天合并后的 data 叠加）
-  const filteredData = useMemo(() => {
-    if (!selectedTagIds.length) return data || [];
-    return (data || []).filter((ins) => {
-      const ids = normalizeTagIds(ins.tag);
-      return ids.some((id) => selectedTagIds.includes(String(id)));
-    });
-  }, [data, selectedTagIds]);
 
   return (
     <>
-      <h2>分析结果</h2>
+      <h2>最新内容</h2>
 
-      {/* 多选日期 */}
+      {/* 顶部：日期范围 + 快捷选择 */}
+      <div className="mt-4 p-4 border rounded-lg">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="grow">
+            <div className="font-medium">按日期范围选择</div>
+            <div className="mt-3 flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-2 text-sm">
+                <span>开始</span>
+                <input
+                  type="date"
+                  value={rangeStart}
+                  onChange={(e) => setRangeStart(e.target.value)}
+                  className="border rounded px-2 py-1"
+                />
+              </div>
+              <div className="flex items-center gap-2 text-sm">
+                <span>结束</span>
+                <input
+                  type="date"
+                  value={rangeEnd}
+                  onChange={(e) => setRangeEnd(e.target.value)}
+                  className="border rounded px-2 py-1"
+                />
+              </div>
+              <Button size="sm" onClick={applyRange}>应用范围到多选</Button>
+              <Button size="sm" variant="outline" onClick={() => { setRangeStart(""); setRangeEnd(""); }}>清空</Button>
+            </div>
+          </div>
+
+          {/* 快捷：当天 / 近7天（仅改变展示选择） */}
+          <div className="flex items-center gap-2">
+            <Button size="sm" onClick={quickToday}>选择「今天」</Button>
+            <Button size="sm" variant="outline" onClick={quickLast7Days}>选择「近7天」</Button>
+          </div>
+        </div>
+      </div>
+
+      {/* 保留原有：逐日多选 */}
       <div className="my-4">
         <p className="mb-2 text-sm text-slate-500">选择一个或多个日期：</p>
         <DateMultiPicker dates={allDates} selected={selectedDates} onChange={setSelectedDates} />
       </div>
 
-      {/* ===== 新增：标签筛选（位于日期选择下面，独立卡片） ===== */}
+      {/* 标签筛选 */}
       <div className="mt-4 p-4 border rounded-lg">
         <div className="flex items-center justify-between">
           <div className="font-medium">按标签筛选</div>
-          <div className="text-sm text-gray-500">
-            {tagsQuery.isLoading ? "加载标签…" : `可选 ${allTagItems.length} 个`}
-          </div>
+          <div className="text-sm text-gray-500">{tagsQuery.isLoading ? "加载标签…" : `可选 ${allTagItems.length} 个`}</div>
         </div>
         <div className="mt-3 flex flex-wrap gap-2">
           {allTagItems.map((t) => {
@@ -302,41 +385,39 @@ export default function InsightsScreen() {
                 key={t.id}
                 type="button"
                 onClick={() =>
-                  setSelectedTagIds((prev) =>
-                    prev.includes(t.id) ? prev.filter((x) => x !== t.id) : [...prev, t.id]
-                  )
+                  setSelectedTagIds((prev) => (prev.includes(t.id) ? prev.filter((x) => x !== t.id) : [...prev, t.id]))
                 }
                 className={[
                   "px-3 py-1 rounded-full border text-sm transition",
-                  active
-                    ? "bg-blue-600 text-white border-blue-600"
-                    : "bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100",
+                  active ? "bg-blue-600 text-white border-blue-600" : "bg-gray-50 text-gray-700 border-gray-200 hover:bg-gray-100",
                 ].join(" ")}
               >
                 {t.name}
               </button>
             );
           })}
-          {allTagItems.length === 0 && (
-            <span className="text-sm text-gray-400">暂无可用标签</span>
-          )}
+          {allTagItems.length === 0 && <span className="text-sm text-gray-400">暂无可用标签</span>}
         </div>
-
         {selectedTagIds.length > 0 && (
           <div className="mt-3 flex items-center gap-3">
-            <span className="text-sm text-gray-600">
-              已选：{selectedTagIds.map((id) => tagIdToName.get(id) || id).join("、")}
-            </span>
+            <span className="text-sm text-gray-600">已选：{selectedTagIds.map((id) => tagIdToName.get(id) || id).join("、")}</span>
             <Button size="sm" variant="outline" onClick={() => setSelectedTagIds([])}>清除标签</Button>
           </div>
         )}
       </div>
 
       {/* 操作区 */}
-      <div className="mb-4 mt-4 flex gap-3 items-center">
-        <Button onClick={reportAllSelectedDays}>生成所选日期报告</Button>
-        <Button variant="outline" onClick={reportSelected}>生成勾选报告</Button>
+      <div className="mb-4 mt-4 flex flex-wrap gap-3 items-center">
+        {/* 单一生成按钮：根据“勾选的内容 + 上方选择条件”调用固定函数 */}
+        <Button onClick={reportSelected}>根据选择生成报告</Button>
         <span className="text-sm text-slate-500">已选 {selectedIds.length} 条</span>
+
+        {/* 全选/反选/清空 —— 作用于“当前过滤后可见列表” */}
+        <div className="ml-auto flex gap-2 items-center">
+          <Button size="sm" variant="outline" onClick={selectAllVisible}>全选可见</Button>
+          <Button size="sm" variant="outline" onClick={invertSelection}>反选可见</Button>
+          <Button size="sm" variant="ghost" onClick={clearSelection}>清空选择</Button>
+        </div>
       </div>
 
       {isLoading && <p>加载中…</p>}
@@ -346,7 +427,7 @@ export default function InsightsScreen() {
         <div className="grid w-full gap-1.5">
           <div className="flex gap-2 items-center">
             <div className="flex-1">
-              <p>选择一项结果生成文档，或勾选多项后点击上方按钮生成合并报告</p>
+              <p>勾选需要生成报告的洞见；按钮在上方。</p>
             </div>
           </div>
           <div className="w-full gap-1.5">
@@ -356,27 +437,15 @@ export default function InsightsScreen() {
               selectedIds={selectedIds}
               onToggleSelect={onToggleSelect}
               onOpen={(id) => useClientStore.getState().selectInsight(id)}
-              onDelete={(insight_id, article_id) => unlink(insight_id, article_id)}
-              onReport={reportSingle}
+              onDelete={(insight_id, article_id) => mutUnlink.mutate({ insight_id, article_id })}
               onMore={() => selectedInsight && mutMore.mutate({ insight_id: selectedInsight })}
-              isGettingMore={mutMore.isPending}
               error={null}
-              // 👇 传给子组件做名称展示
               tagIdToName={tagIdToName}
             />
-            <p className="text-sm text-muted-foreground mt-4">
-              共 {filteredData.length} 条结果（已合并 {selectedDates.length} 天）
-            </p>
+            <p className="text-sm text-muted-foreground mt-4">共 {filteredData.length} 条结果（已合并 {selectedDates.length} 天）</p>
           </div>
         </div>
       )}
-
-      <div className="my-6 flex flex-col gap-4 w-36 text-left">
-        <Button variant="outline" onClick={() => navigate("/articles")}>查看所有文章</Button>
-        <a href={`${import.meta.env.VITE_PB_BASE}/_/`} target="__blank" className="text-sm underline">
-          数据库管理 &gt;
-        </a>
-      </div>
 
       <Toaster />
     </>

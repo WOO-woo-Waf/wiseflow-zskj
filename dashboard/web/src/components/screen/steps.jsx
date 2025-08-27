@@ -10,7 +10,7 @@ export default function Steps() {
   const navigate = useNavigate();
 
   const idx = Math.max(0, order.indexOf(pathname));
-  const titles = ["数据来源", "文章列表", "分析结果", "生成报告"];
+  const titles = ["信源管理", "最新内容", "行业洞察", "生成报告"];
   const title = `${TITLE} > ${titles[idx] || "步骤"}`;
 
   const go = (to) => navigate(to);
